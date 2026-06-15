@@ -1,0 +1,27 @@
+{
+    "name": "Example 26.3: Triple integrator (energy functional)",
+    "x_start": 0.0,
+    "x_end": 3.275,
+    "equations": [
+        "Derivative(x1(t), t) - x2 = 0",
+        "Derivative(x2(t), t) - x3 = 0",
+        "Derivative(x3(t), t) - 0.5*(sqrt(1e-10 + (x6 + 1)**2) - sqrt(1e-10 + (x6 - 1)**2)) = 0",
+        "Derivative(x4(t), t) = 0",
+        "Derivative(x5(t), t) + x4 = 0",
+        "Derivative(x6(t), t) + x5 = 0"
+    ],
+    "boundary_conditions": [
+        "x1(a) = 1",
+        "x2(a) = 0",
+        "x3(a) = 0",
+        "x1(b) = 0",
+        "x2(b) = 0",
+        "x3(b) = 0"
+    ],
+    "parameters": null,
+    "n_points": 500,
+    "continuation_param": "lambda",
+    "continuation_start": 0.0,
+    "continuation_end": 1.0,
+    "continuation_steps": 10
+}

@@ -1,0 +1,23 @@
+{
+    "name": "Example 26.1: Two-body problem (Kepler orbit)",
+    "x_start": 0.0,
+    "x_end": 7.0,
+    "equations": [
+        "Derivative(x1(t), t) - x3 = 0",
+        "Derivative(x2(t), t) - x4 = 0",
+        "Derivative(x3(t), t) + x1 / (x1**2 + x2**2)**(3/2) = 0",
+        "Derivative(x4(t), t) + x2 / (x1**2 + x2**2)**(3/2) = 0"
+    ],
+    "boundary_conditions": [
+        "x1(a) = 2",
+        "x2(a) = 0",
+        "x1(b) = 1.0738644361",
+        "x2(b) = -1.0995343576"
+    ],
+    "parameters": null,
+    "n_points": 200,
+    "continuation_param": "lambda",
+    "continuation_start": 0.0,
+    "continuation_end": 1.0,
+    "continuation_steps": 10
+}

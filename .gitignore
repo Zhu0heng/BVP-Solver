@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+ENV/
+
+# Локальное состояние приложения / инструментов
+history.json
+.claude/
+
+# ОС / редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

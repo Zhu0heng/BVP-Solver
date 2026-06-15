@@ -1,0 +1,21 @@
+{
+    "name": "Van der Pol oscillator (periodic orbit, μ continuation)",
+    "x_start": 0.0,
+    "x_end": 1.0,
+    "equations": [
+        "Derivative(x1(t), t) - x3*x2 = 0",
+        "Derivative(x2(t), t) - x3*(mu*(1 - x1**2)*x2 - x1) = 0",
+        "Derivative(x3(t), t) = 0"
+    ],
+    "boundary_conditions": [
+        "x2(a) = 0",
+        "x2(b) = 0",
+        "x1(a) = x1(b)"
+    ],
+    "parameters": null,
+    "n_points": 500,
+    "continuation_param": "mu",
+    "continuation_start": 0.0,
+    "continuation_end": 3.0,
+    "continuation_steps": 30
+}

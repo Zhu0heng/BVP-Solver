@@ -1,0 +1,27 @@
+{
+    "name": "Example 26.4: Управление в форме лунки (Time-optimal, lens-shaped control)",
+    "x_start": 0.0,
+    "x_end": 5.0,
+    "equations": [
+        "Derivative(x1(t), t) - (x2 + u1) = 0",
+        "Derivative(x2(t), t) - (-1.5*x1 - 0.25*x2 + u2) = 0"
+    ],
+    "boundary_conditions": [
+        "x1(a) = 4",
+        "x2(a) = 1",
+        "x1(b) = 0",
+        "x2(b) = 0"
+    ],
+    "parameters": {
+        "mu_values": [
+            1.0,
+            0.1,
+            1e-06
+        ]
+    },
+    "n_points": 500,
+    "continuation_param": "lambda",
+    "continuation_start": 0.0,
+    "continuation_end": 1.0,
+    "continuation_steps": 10
+}
