@@ -21,10 +21,13 @@ project/
 ├── CHANGELOG.txt          # Журнал изменений
 ├── main.py                # Точка входа приложения
 ├── solver.py              # Функции для решения ОДУ и краевых задач
+├── parser.py              # Безопасный разбор уравнений и граничных условий
+├── control_problems.py    # Динамика задач оптимального управления
 ├── task_io.py             # Функции загрузки/сохранения задач
 ├── dataset.py             # Класс Dataset для хранения параметров задачи
 ├── examples/              # Библиотека примеров
 ├── gui.py                 # Графический интерфейс
+├── ui_theme.py            # Стили интерфейса
 └── tests/                 # Тесты модулей
 ```
 
@@ -39,8 +42,13 @@ pip install -r requirements.txt
 Запустите приложение:
 
 ```bash
-set PYTHONPATH=D:\Lib\site-packages
 python main.py
+```
+
+Запуск тестов:
+
+```bash
+python -m pytest -q
 ```
 
 ## Формат граничных условий

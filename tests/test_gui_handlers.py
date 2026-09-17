@@ -78,6 +78,8 @@ class TestButtonWiring:
         try:
             w = gui.MainWindow()
             w.solve_btn.click()
+            # No result exists yet; enable only to inspect the signal connection.
+            w.graph_btn.setEnabled(True)
             w.graph_btn.click()
             w.export_btn.click()
             w.clear_btn.click()
@@ -101,12 +103,14 @@ class TestSetDatasetToUI:
     def test_limit_cycle_population(self, win):
         win.set_dataset_to_ui(get_example_tasks()[1])
         assert win.guess_edit.text() == '2, 6.5, 9'
-        assert win.multi_cycle_cb.isChecked() is True
+        assert win.multi_cycle_cb.isHidden() is True
+        assert win.multi_cycle_cb.isChecked() is False
         bc_lines = [l for l in win.bc_edit.toPlainText().split('\n') if l.strip()]
         assert len(bc_lines) == 4
 
     def test_non_limit_cycle_unchecks_multi(self, win):
         win.set_dataset_to_ui(get_example_tasks()[0])   # Kepler
+        assert win.multi_cycle_cb.isHidden() is True
         assert win.multi_cycle_cb.isChecked() is False
         assert win.name_edit.text() == get_example_tasks()[0].name
 
@@ -116,7 +120,7 @@ class TestGetVarnames:
         win._last_x = None
         win._last_y = np.zeros((4, 10))
         win._last_problem_type = 'limit_cycle'
-        assert win._get_varnames() == ['x1', 'x2', 'T', 'x3']
+        assert win._get_varnames() == ['x1', 'x2', 'T', 'x4']
         win._last_problem_type = 'kepler'
         assert win._get_varnames() == ['x1', 'x2', 'x3', 'x4']
         win._last_y = np.zeros((2, 10))

@@ -248,19 +248,22 @@ def parse_equation_system(equations, param_name='lambda'):
 
 def _normalize_bc(bc_str):
     s = bc_str.strip()
-    m = re.match(r'x(\d+)\(([ab])\)\s*=\s*(.+)', s)
-    if m:
-        i = int(m.group(1))
-        ep = m.group(2)
-        rhs = m.group(3).strip()
-        var = f'x{i}{0 if ep == "a" else 1}'
-        rhs_normalized = re.sub(
-            r'x(\d+)\(([ab])\)',
-            lambda mm: f'x{mm.group(1)}{0 if mm.group(2) == "a" else 1}',
-            rhs
-        )
-        return f'{var} - ({rhs_normalized})'
-    return s
+    # Replace endpoint notation everywhere, not only when a single x_i is on
+    # the left.  This makes residual and equality forms equivalent, e.g.
+    # ``x1(a)**2 - 4`` and ``x1(a)**2 = 4``.
+    normalized = re.sub(
+        r'x(\d+)\(([ab])\)',
+        lambda match: f'x{match.group(1)}{0 if match.group(2) == "a" else 1}',
+        s,
+    )
+    if '=' not in normalized:
+        return normalized
+    if normalized.count('=') != 1:
+        raise ValueError(f"Boundary condition must contain at most one '=': {bc_str}")
+    lhs, rhs = (part.strip() for part in normalized.split('=', 1))
+    if not lhs or not rhs:
+        raise ValueError(f"Incomplete boundary condition: {bc_str}")
+    return f'{lhs} - ({rhs})'
 
 
 def parse_boundary_conditions(bc_str_list, param_name='lambda', bc_var_names=None):

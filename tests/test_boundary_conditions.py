@@ -39,6 +39,13 @@ class TestBCNormalization:
     def test_coupled_bc_start(self):
         assert _normalize_bc("x1(a) = x4(a)") == "x10 - (x40)"
 
+    def test_nonlinear_equality(self):
+        assert _normalize_bc("x1(a)**2 - x2(b) = 4") == \
+               "x10**2 - x21 - (4)"
+
+    def test_nonlinear_residual_endpoint_notation(self):
+        assert _normalize_bc("x1(a)**2 - 4") == "x10**2 - 4"
+
     def test_shorthand_passthrough(self):
         # уже-остаточная краткая форма не меняется
         assert _normalize_bc("y0") == "y0"

@@ -10,6 +10,7 @@
 import sys
 import numpy as np
 import re
+from scipy.spatial import cKDTree
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QPushButton, QGroupBox, QCheckBox,
@@ -17,6 +18,7 @@ from PyQt5.QtWidgets import (
     QInputDialog, QComboBox, QScrollArea, QMenu, QListWidget, QFrame
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QValidator
 import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -29,10 +31,94 @@ plt.rcParams.update({'font.size': 14})
 from dataset import Dataset
 from solver import ContinuationSolver
 from task_io import save_task, load_task, get_example_tasks
+from ui_theme import STYLESHEET, SURFACE, TEXT, MUTED, BORDER
+
+
+# Generic line-style policy: color distinguishes solutions/layers, while
+# line style distinguishes variables or parameter layers.  This keeps plots
+# readable when users change equations, variable names, or parameter values.
+VARIABLE_LINE_STYLES = ('-', '--', '-.', ':')
+LAYER_LINE_STYLES = ('--', ':', '-', '-.')
+
+
+def _curve_linestyle(variable_index=0, layer_index=0,
+                     variable_count=1, layer_count=1,
+                     has_reference_curve=False, overlaps_existing=False):
+    """Use dashes only to separate a curve that visually overlaps another."""
+    return '--' if overlaps_existing else '-'
+
+
+def _semantic_variable_linestyle(name, selected_names, fallback_index):
+    """Variables no longer receive a dash merely because of their meaning."""
+    return '-'
+
+
+def _curve_overlap_mask(x, y, previous_curves):
+    """Mark sustained shared segments while ignoring isolated crossings.
+
+    Coordinates are normalised per pair, then each point of the new curve is
+    compared with the nearest point of an existing curve.  At least four
+    consecutive points (or 8% of the sampled curve) must be close, so curves
+    that merely intersect once remain solid.
+    """
+    x_values = np.asarray(x, dtype=float).ravel()
+    y_values = np.asarray(y, dtype=float).ravel()
+    current = np.column_stack((x_values, y_values))
+    finite = np.isfinite(current).all(axis=1)
+    result = np.zeros(len(current), dtype=bool)
+    if np.count_nonzero(finite) < 4:
+        return result
+    for old_x, old_y in previous_curves:
+        old = np.column_stack((np.asarray(old_x, dtype=float).ravel(),
+                               np.asarray(old_y, dtype=float).ravel()))
+        old = old[np.isfinite(old).all(axis=1)]
+        if len(old) < 4:
+            continue
+        joined = np.vstack((current[finite], old))
+        scale = np.ptp(joined, axis=0)
+        scale[scale < 1e-12] = 1.0
+        tree = cKDTree(old / scale)
+        nearest, _ = tree.query(current[finite] / scale, k=1)
+        close_finite = nearest <= 3e-3
+        close = np.zeros(len(current), dtype=bool)
+        close[np.flatnonzero(finite)] = close_finite
+        required = max(4, int(np.ceil(0.08 * len(close))))
+        start = None
+        for index, value in enumerate(np.r_[close, False]):
+            if value and start is None:
+                start = index
+            elif not value and start is not None:
+                if index - start >= required:
+                    result[start:index] = True
+                start = None
+    return result
+
+
+def _curves_visually_overlap(x, y, previous_curves):
+    """Compatibility predicate for callers that only need yes/no."""
+    return bool(np.any(_curve_overlap_mask(x, y, previous_curves)))
 
 # Parallel to TR['sol_method_items'] — language-independent solver codes.
 # Index 0 = auto-detect (legacy behaviour), 1..5 = explicit choices.
 _SOLVER_CODES = ['auto', 'custom', 'kepler', 'limit_cycle', 'triple', 'lens']
+
+
+class ScientificDoubleSpinBox(QDoubleSpinBox):
+    """Display tolerances without hiding their significant digits."""
+    def textFromValue(self, value):
+        return f'{value:.3g}'
+
+    def valueFromText(self, text):
+        return float(text)
+
+    def validate(self, text, pos):
+        try:
+            value = float(text)
+        except ValueError:
+            state = QValidator.Intermediate if re.fullmatch(r'[+\-\d.eE]*',text) else QValidator.Invalid
+            return state, text, pos
+        return (QValidator.Acceptable if np.isfinite(value) and self.minimum() <= value <= self.maximum()
+                else QValidator.Intermediate), text, pos
 
 
 def _solution_is_physical(y, ref_scale=1.0):
@@ -74,9 +160,10 @@ def detect_problem_type(ds):
                 re.search(r'derivative\(x2\(', eqs)):
             return 'kepler'
         # Limit cycles: 4eq with sin term + x2(a)=x2(b)=0
-        if ('sin' in eqs and
-                re.search(r'x2\(a\)\s*=\s*0', bcs) and
-                re.search(r'x2\(b\)\s*=\s*0', bcs)):
+        zero_bc = lambda side: any(re.fullmatch(
+            rf'\s*x2\({side}\)\s*=\s*[+-]?0+(?:\.0*)?(?:[eE][+-]?\d+)?\s*', bc)
+            for bc in ds.boundary_conditions)
+        if ('sin' in eqs and zero_bc('a') and zero_bc('b')):
             return 'limit_cycle'
 
     if n_eq == 6 and 'sqrt' in eqs:
@@ -89,7 +176,10 @@ def detect_problem_type(ds):
 
 
 class SolverThread(QThread):
-    finished = pyqtSignal(object, object)
+    # Do not shadow QThread.finished(): Qt emits that zero-argument signal when
+    # the native thread exits.  Overriding it with a two-argument signal can
+    # crash the Windows Qt event dispatcher instead of raising a Python error.
+    result_ready = pyqtSignal(object, object)
     error = pyqtSignal(str)
 
     def __init__(self, dataset, initial_guess=None, smooth_param_list=None, explicit_type=None, multi_cycle=False):
@@ -147,23 +237,18 @@ class SolverThread(QThread):
         ref = max(1.0, float(np.hypot(bx10, bx20)))
 
         # ── Пристрелка из каждой догадки → отдельная орбита ──
-        # Задача Ламберта МНОГОЗНАЧНА: из одного набора seed пристрелка может
-        # сойтись к РАЗНЫМ корректным орбитам.  Поэтому для каждой догадки
-        # собираем ВСЕ найденные корректные решения и выбираем то, чьё v0
-        # БЛИЖЕ ВСЕГО к самой догадке (vx, vy).  Именно к ближайшему решению
-        # ведёт продолжение по параметру из начальной точки; «перескок»
-        # обычного метода Ньютона/ЛМ к дальнему корню — численный артефакт.
-        # Для учебной догадки (0.5, 0.5) это даёт ans1 ≈ (0, 0.5).
+        # First follow the user's seed with the textbook continuation method.
+        # That path is the branch-selection mechanism, so scanning ten more
+        # seeds after it has already produced a valid orbit is both wasteful
+        # and semantically wrong.  A short fallback list is used only when the
+        # requested path genuinely fails.
         layers = []
         seen = []  # подписи v0 для дедупликации совпавших орбит
         for (gx10, gx20, vx, vy) in guesses:
             v_scale = max(0.3, ref / 4.0)
-            # Широкий набор seed, покрывающий оба «бассейна» решений Ламберта.
-            seeds = [(vx, vy), (-vx, -vy), (vy, -vx), (-vy, vx),
-                     (0.0, vy), (0.0, -vy),
-                     (0.0, v_scale), (0.0, -v_scale),
-                     (v_scale, -v_scale), (-v_scale, v_scale)]
-            cands = {}  # подпись v0 → (xs, ys) корректного решения
+            seeds = [(vx, vy), (0.0, vy), (vy, -vx),
+                     (-vx, -vy), (0.0, v_scale), (v_scale, -v_scale)]
+            selected = None
             for svx, svy in seeds:
                 try:
                     cand_x, cand_y = solver.solve(
@@ -174,17 +259,11 @@ class SolverThread(QThread):
                     continue
                 sig = (round(float(cand_y[2, 0]), 3),
                        round(float(cand_y[3, 0]), 3))
-                cands.setdefault(sig, (cand_x, cand_y))
-            if not cands:
-                continue
-            # Выбираем решение, ближайшее к самой догадке (vx, vy).
-            best = None  # (расстояние², подпись, xs, ys)
-            for sig, (cand_x, cand_y) in cands.items():
-                d2 = ((float(cand_y[2, 0]) - vx) ** 2
-                      + (float(cand_y[3, 0]) - vy) ** 2)
-                if best is None or d2 < best[0]:
-                    best = (d2, sig, cand_x, cand_y)
-            _, sig, xs, ys = best
+                selected = (sig, cand_x, cand_y)
+                break
+            if selected is None:
+                raise RuntimeError(f'No valid Kepler trajectory for initial velocity ({vx:g}, {vy:g}).')
+            sig, xs, ys = selected
             if sig in seen:
                 continue
             seen.append(sig)
@@ -198,7 +277,7 @@ class SolverThread(QThread):
         if not layers:
             raise RuntimeError("Kepler BVP did not converge — "
                                "check BCs and initial guess")
-        self.finished.emit(layers, None)
+        self.result_ready.emit(layers, None)
 
     def _solve_limit_cycles(self):
         """Solve for ONE limit cycle using the user's guess values directly.
@@ -212,8 +291,8 @@ class SolverThread(QThread):
         cycle to converge to.  The plot window shows exactly ONE layer
         per solve call.
 
-        If the user-provided guess fails, we fall back to a broad scan
-        (80 points from 0.1 to 30) to find any cycles.
+        Each requested guess must yield a nontrivial validated cycle;
+        failures are reported rather than substituted with an unrelated scan.
         """
         solver = ContinuationSolver(self.dataset)
 
@@ -238,10 +317,6 @@ class SolverThread(QThread):
                 ug_raw[base + 3] if base + 3 < len(ug_raw) else 0.5,
             ]
             ug[1] = 0.0              # x2(0)=0 always (from BC)
-            if ug[2] < 1.0:
-                ug[2] = 2 * np.pi
-            if abs(ug[3]) < 1e-6:
-                ug[3] = ug[0]
             g_direct = np.array(ug, dtype=float)
 
             try:
@@ -254,39 +329,16 @@ class SolverThread(QThread):
                             (x_eval, y_eval, None,
                              f'x1={x1_val:.2f} T={T_val:.2f}  '
                              f'← guess ({g_direct[0]:.3g}, {g_direct[2]:.3g})'))
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError(f'Limit cycle guess {gi+1} failed: {exc}') from exc
+            if len(all_solutions) != gi + 1:
+                raise RuntimeError(f'Guess {gi+1} converged to a trivial or invalid cycle.')
 
         if all_solutions:
-            self.finished.emit(all_solutions, None)
+            self.result_ready.emit(all_solutions, None)
             return
 
-        # ── Phase 2: fallback — broad scan ──
-        found_keys = []
-        solutions = []
-        for x1_guess in np.linspace(0.1, 30.0, 80):
-            g = np.array([x1_guess, 0.0, ug[2], x1_guess], dtype=float)
-            try:
-                x_eval, y_eval = solver.solve(g)
-            except Exception:
-                continue
-            if not _solution_is_physical(y_eval, max(1.0, abs(x1_guess))):
-                continue
-            x1_val = y_eval[0, 0]
-            T_val = y_eval[2, 0]
-            if abs(x1_val) < 1e-3 or abs(T_val) < 1e-3:
-                continue
-            key = (round(abs(x1_val), 1), round(abs(T_val), 2))
-            if any(abs(key[0] - k[0]) < 0.1 and abs(key[1] - k[1]) < 0.2
-                   for k in found_keys):
-                continue
-            found_keys.append(key)
-            solutions.append((x_eval, y_eval, None,
-                             f'x1={x1_val:.2f} T={T_val:.2f}'))
-
-        if not solutions:
-            raise RuntimeError("No limit cycle found — try different initial guess")
-        self.finished.emit(solutions, None)
+        raise RuntimeError('No nontrivial limit cycle found for the supplied guesses.')
 
     def _solve_triple(self):
         """Solve the triple-integrator BVP by SHOOTING the 3 unknown costates.
@@ -307,23 +359,56 @@ class SolverThread(QThread):
         T = self.dataset.x_end
         t0 = self.dataset.x_start
 
-        # ── Извлекаем BC левого/правого края ──
-        a_vals = {1: 1.0, 2: 0.0, 3: 0.0}      # defaults: original problem
-        b_vals = {1: 0.0, 2: 0.0, 3: 0.0}
-        for bc in self.dataset.boundary_conditions:
-            ma = re.match(r'\s*x(\d+)\(a\)\s*=\s*([+-]?[\d.eE+\-]+)\s*$', bc)
-            mb = re.match(r'\s*x(\d+)\(b\)\s*=\s*([+-]?[\d.eE+\-]+)\s*$', bc)
-            if ma:
-                a_vals[int(ma.group(1))] = float(ma.group(2))
-            elif mb:
-                b_vals[int(mb.group(1))] = float(mb.group(2))
+        from control_problems import fixed_boundary_values
+        a_fixed, b_fixed = fixed_boundary_values(self.dataset, (1, 2, 3))
+        a_vals = dict(enumerate(a_fixed, 1))
+        b_vals = dict(enumerate(b_fixed, 1))
+        param_val = float((self.dataset.parameters or {}).get(
+            self.dataset.continuation_param, self.dataset.continuation_end))
 
         def user_ode(t, y):
-            # Use current parameter value from dataset, not hardcoded 0.0
-            params = self.dataset.parameters or {}
-            param_val = float(params.get(self.dataset.continuation_param,
-                                         getattr(self.dataset, 'continuation_start', 0.0)))
             return solver._ode_system(t, y, param_val)
+
+        # Fast necessary reachability check for the classic rest-to-rest
+        # triple integrator.  With x1'=c1*x2, x2'=c2*x3 and |x3'|<=J, the
+        # largest displacement over a fixed duration is
+        # |c1*c2|*J*T^3/32.  Rejecting only beyond this upper bound avoids a
+        # minutes-long multistart search for a mathematically impossible BVP.
+        try:
+            zero = np.zeros(n)
+            base = np.asarray(user_ode(t0, zero), dtype=float)
+            x2_one = zero.copy(); x2_one[1] = 1.0
+            x2_two = zero.copy(); x2_two[1] = 2.0
+            x3_one = zero.copy(); x3_one[2] = 1.0
+            x3_two = zero.copy(); x3_two[2] = 2.0
+            c1 = float(user_ode(t0, x2_one)[0] - base[0])
+            c2 = float(user_ode(t0, x3_one)[1] - base[1])
+            linear_chain = (
+                abs(base[0]) < 1e-10 and abs(base[1]) < 1e-10
+                and abs(user_ode(t0, x2_two)[0] - base[0] - 2*c1) < 1e-8
+                and abs(user_ode(t0, x3_two)[1] - base[1] - 2*c2) < 1e-8
+            )
+            plus = zero.copy(); plus[5] = 1e6
+            minus = zero.copy(); minus[5] = -1e6
+            jerk_bound = max(abs(float(user_ode(t0, plus)[2])),
+                             abs(float(user_ode(t0, minus)[2])))
+            rest_to_rest = (max(abs(a_fixed[1]), abs(a_fixed[2]),
+                                abs(b_fixed[1]), abs(b_fixed[2])) < 1e-10)
+            if linear_chain and rest_to_rest and np.isfinite(jerk_bound):
+                duration = T - t0
+                displacement_bound = abs(c1*c2) * jerk_bound * duration**3 / 32.0
+                requested = abs(float(b_fixed[0] - a_fixed[0]))
+                if requested > displacement_bound * (1 + 1e-7) + 1e-9:
+                    raise RuntimeError(
+                        'Triple-integrator boundary is unreachable for the '
+                        f'fixed interval: required displacement {requested:.6g} '
+                        f'exceeds the theoretical bound {displacement_bound:.6g}.')
+        except RuntimeError:
+            raise
+        except Exception:
+            # If the edited equations are not the classic linear chain, skip
+            # this specialised necessary check and use the general solver.
+            pass
 
         # ── Shooting residual (3-мерный) ──
         # Uses tight ODE tolerances so that finite-difference Jacobians
@@ -340,6 +425,8 @@ class SolverThread(QThread):
                                  dense_output=True,
                                  rtol=1e-12, atol=1e-14, max_step=0.005,
                                  method='DOP853')
+                if not sol.success:
+                    return np.full(3, 1e10)
                 ye = sol.sol(T)
             except Exception:
                 return np.full(3, 1e10)
@@ -357,49 +444,83 @@ class SolverThread(QThread):
         #      are scanned over a sign-grid.  This works for ANY modified
         #      ODE, not just the original example.
         #   3. Coarse 3-D Sobol-like grid as final fallback.
-        starts = []
-
+        fallback_starts = []
+        user_start = None
         if self.initial_guess is not None and len(self.initial_guess) >= 6:
-            starts.append(np.asarray(self.initial_guess[3:6], dtype=float))
+            user_start = np.asarray(self.initial_guess[3:6], dtype=float)
+        neutral_start = np.full(3, 0.5, dtype=float)
 
-        # Terminal state from b-side BCs (constrained components) + sign-grid
-        # scan over the unconstrained ones.  We integrate the USER's ODE
-        # backwards from each candidate.
-        y_terminal_known = np.zeros(6)
-        for i in (1, 2, 3):
-            y_terminal_known[i - 1] = b_vals.get(i, 0.0)
+        def build_fallback_starts():
+            """Create expensive backward seeds lazily, only when needed."""
+            starts = []
+            y_terminal_known = np.zeros(6)
+            for i in (1, 2, 3):
+                y_terminal_known[i - 1] = b_vals.get(i, 0.0)
+            for sx in (-1.0, 1.0):
+                for sy in (-1.0, 1.0):
+                    for sz in (-1.0, 1.0):
+                        y_T = y_terminal_known.copy()
+                        y_T[3], y_T[4], y_T[5] = sx * 3.0, sy * 5.0, sz * 3.0
+                        try:
+                            sol_bwd = _solve_ivp(
+                                user_ode, [T, t0], y_T,
+                                dense_output=True, rtol=1e-9, atol=1e-12,
+                            )
+                            if sol_bwd.success:
+                                starts.append(sol_bwd.sol(t0)[3:6])
+                        except Exception:
+                            continue
+            rng = np.random.default_rng(42)
+            for _ in range(4):
+                starts.append(rng.uniform(-10.0, 10.0, size=3))
+            return starts
 
-        for sx in (-1.0, 1.0):
-            for sy in (-1.0, 1.0):
-                for sz in (-1.0, 1.0):
-                    y_T = y_terminal_known.copy()
-                    y_T[3], y_T[4], y_T[5] = sx * 3.0, sy * 5.0, sz * 3.0
-                    try:
-                        sol_bwd = _solve_ivp(
-                            lambda tau, y: [-v for v in user_ode(0.0, y)],
-                            [0.0, T], y_T,
-                            dense_output=True, rtol=1e-9, atol=1e-12,
-                        )
-                        starts.append(sol_bwd.sol(T)[3:6])
-                    except Exception:
-                        continue
-
-        # Coarse random fallback grid (10 quasi-random points)
-        rng = np.random.default_rng(42)
-        for _ in range(10):
-            starts.append(rng.uniform(-10.0, 10.0, size=3))
-
-        # ── Try each start, keep the one with the lowest terminal residual ──
-        # Each start gets up to 2 LM rounds (warm-restart from best so far
-        # if first LM didn't fully converge).
+        # ── Tier 1: a bounded quick attempt from the edited user guess ──
         best_x, best_r = None, np.inf
-        for st in starts:
+        component_tol = max(1e-7, 100 * solver.tol)
+        # best_r is an L2 norm of three endpoint residuals; compare it with
+        # sqrt(3) times the per-component tolerance used elsewhere.
+        accept_tol = np.sqrt(3.0) * component_tol
+        if user_start is not None and not np.allclose(user_start, neutral_start):
+            try:
+                res = _root(shoot, user_start, method='lm',
+                            options={'ftol': 1e-12, 'xtol': 1e-12,
+                                     'maxiter': 30, 'factor': 0.1})
+                r = float(np.linalg.norm(shoot(res.x)))
+                if np.isfinite(r):
+                    best_x, best_r = res.x.copy(), r
+            except Exception:
+                pass
+
+        # ── Tier 2: textbook continuation from a neutral seed ──
+        # This solves the common/convex case much faster than hundreds of LM
+        # integrations and still uses the actual edited equations and BCs.
+        if best_r > accept_tol:
+            neutral_full = np.array([
+                a_vals.get(1, 1.0), a_vals.get(2, 0.0), a_vals.get(3, 0.0),
+                *neutral_start,
+            ], dtype=float)
+            try:
+                _, neutral_y = solver.solve(neutral_full)
+                candidate = neutral_y[3:6, 0]
+                r = float(np.linalg.norm(shoot(candidate)))
+                if r < best_r:
+                    best_x, best_r = candidate.copy(), r
+            except Exception:
+                pass
+
+        # ── Tier 3: bounded fallback for materially changed equations ──
+        if best_r > accept_tol:
+            fallback_starts = build_fallback_starts()
+        for st in fallback_starts:
+            if best_r <= accept_tol:
+                break
             cur = np.asarray(st, dtype=float)
             for _round in range(2):
                 try:
                     res = _root(shoot, cur, method='lm',
                                 options={'ftol': 1e-14, 'xtol': 1e-14,
-                                         'maxiter': 500,
+                                         'maxiter': 150,
                                          'factor': 0.1})
                 except Exception:
                     break
@@ -407,13 +528,13 @@ class SolverThread(QThread):
                 cur = res.x
                 if r < best_r:
                     best_x, best_r = res.x.copy(), r
-                if r < 1e-9:
+                if r <= accept_tol:
                     break
-            if best_r < 1e-9:
+            if best_r <= accept_tol:
                 break
 
-        if best_x is None:
-            raise RuntimeError("Triple integrator shooting failed for all starts")
+        if best_x is None or best_r > accept_tol:
+            raise RuntimeError(f"Triple integrator did not satisfy boundary conditions (residual={best_r:.3g})")
 
         y0_final = np.array([
             a_vals.get(1, 1.0), a_vals.get(2, 0.0), a_vals.get(3, 0.0),
@@ -425,17 +546,22 @@ class SolverThread(QThread):
         sol_final = _solve_ivp(user_ode, [t0, T], y0_final,
                                dense_output=True, method=_method,
                                rtol=_tol, atol=_tol * 1e-3, max_step=0.01)
+        if not sol_final.success:
+            raise RuntimeError(sol_final.message)
         y_eval = sol_final.sol(x_eval)
+        if (not np.isfinite(y_eval).all() or
+                np.max(np.abs(y_eval[:3, -1] - b_fixed)) > max(1e-6, 100 * _tol)):
+            raise RuntimeError('Final trajectory does not satisfy the boundary conditions.')
 
         # Control u(t) = RHS уравнения dx3/dt (user-defined)
         try:
-            u_t = np.array([solver.ode_funcs[2](x_eval[j], *y_eval[:, j], 0.0)
+            u_t = np.array([solver.ode_funcs[2](x_eval[j], *y_eval[:, j], param_val)
                             for j in range(len(x_eval))])
             y_out = np.vstack([y_eval, u_t.reshape(1, -1)])
         except Exception:
             y_out = y_eval
 
-        self.finished.emit(x_eval, y_out)
+        self.result_ready.emit(x_eval, y_out)
 
     def _solve_lens_control(self):
         """Solve the time-optimal lens-shaped control problem.
@@ -448,101 +574,13 @@ class SolverThread(QThread):
         """
         from scipy.integrate import solve_ivp
         from scipy.optimize import root
-        import sympy as sp
+        from control_problems import LensDynamics, fixed_boundary_values
 
-        # ── 1. BC левого и правого края ──
-        # a1,a2 — начальное состояние; b1,b2 — целевое состояние на правом крае.
-        # Раньше правый край был жёстко зашит в начало координат (0,0), из-за
-        # чего изменение x1(b)/x2(b) в GUI не влияло на решение.
-        a1, a2 = 4.0, 1.0
-        b1, b2 = 0.0, 0.0
-        for bc in self.dataset.boundary_conditions:
-            m = re.match(r'\s*x1\(a\)\s*=\s*([+-]?[\d.eE+\-]+)', bc)
-            if m:
-                a1 = float(m.group(1))
-            m = re.match(r'\s*x2\(a\)\s*=\s*([+-]?[\d.eE+\-]+)', bc)
-            if m:
-                a2 = float(m.group(1))
-            m = re.match(r'\s*x1\(b\)\s*=\s*([+-]?[\d.eE+\-]+)', bc)
-            if m:
-                b1 = float(m.group(1))
-            m = re.match(r'\s*x2\(b\)\s*=\s*([+-]?[\d.eE+\-]+)', bc)
-            if m:
-                b2 = float(m.group(1))
+        if self.dataset.x_start != 0 or self.dataset.x_end != 1:
+            raise ValueError('Lens: use dimensionless interval [0, 1]; terminal time T is solved, not prescribed.')
+        (a1, a2), (b1, b2) = fixed_boundary_values(self.dataset, (1, 2))
+        dynamics = LensDynamics(self.dataset)
 
-        # ── 2. Символьный разбор правых частей f1, f2 ──
-        x1s, x2s, u1s, u2s = sp.symbols('x1 x2 u1 u2', real=True)
-        psi1s, psi2s = sp.symbols('psi1 psi2', real=True)
-        d_sym = sp.Symbol('__d__')
-        loc = {
-            'x1': x1s, 'x2': x2s, 'u1': u1s, 'u2': u2s,
-            '__d__': d_sym, 't': sp.Symbol('t'),
-            'sin': sp.sin, 'cos': sp.cos, 'tan': sp.tan,
-            'sqrt': sp.sqrt, 'exp': sp.exp, 'log': sp.log,
-            'pi': sp.pi, 'E': sp.E,
-        }
-
-        # Defaults на случай ошибки парсинга
-        f1_expr = x2s + u1s
-        f2_expr = -sp.Rational(3, 2) * x1s - sp.Rational(1, 4) * x2s + u2s
-
-        try:
-            for eq_str in self.dataset.equations:
-                if not re.search(r'Derivative\(x[12]\(', eq_str):
-                    continue
-                safe = re.sub(r'Derivative\(\w+\(\w+\),\s*\w+\)', '__d__', eq_str)
-                if '=' in safe:
-                    lhs_s, rhs_s = safe.split('=', 1)
-                else:
-                    lhs_s, rhs_s = safe, '0'
-                lhs_e = sp.parse_expr(lhs_s.strip(), local_dict=loc)
-                rhs_e = sp.parse_expr(rhs_s.strip(), local_dict=loc)
-                sols = sp.solve(sp.Eq(lhs_e, rhs_e), d_sym)
-                if not sols:
-                    continue
-                f_rhs = sp.expand(sols[0])
-                if 'Derivative(x1(' in eq_str:
-                    f1_expr = f_rhs
-                elif 'Derivative(x2(' in eq_str:
-                    f2_expr = f_rhs
-        except Exception:
-            pass  # fall back to defaults
-
-        # ── 3. Гамильтониан и сопряжённые уравнения ──
-        # H = 1 + ψ1·f1(x1,x2,u1,u2) + ψ2·f2(x1,x2,u1,u2)
-        # dψ1/dt = -∂H/∂x1 = -(ψ1·∂f1/∂x1 + ψ2·∂f2/∂x1)
-        # dψ2/dt = -∂H/∂x2 = -(ψ1·∂f1/∂x2 + ψ2·∂f2/∂x2)
-        df1_x1 = sp.diff(f1_expr, x1s)
-        df1_x2 = sp.diff(f1_expr, x2s)
-        df2_x1 = sp.diff(f2_expr, x1s)
-        df2_x2 = sp.diff(f2_expr, x2s)
-
-        # Lambdify для быстрых численных вычислений
-        f1_n = sp.lambdify((x1s, x2s, u1s, u2s), f1_expr, modules='numpy')
-        f2_n = sp.lambdify((x1s, x2s, u1s, u2s), f2_expr, modules='numpy')
-        df1_x1_n = sp.lambdify((x1s, x2s, u1s, u2s), df1_x1, modules='numpy')
-        df1_x2_n = sp.lambdify((x1s, x2s, u1s, u2s), df1_x2, modules='numpy')
-        df2_x1_n = sp.lambdify((x1s, x2s, u1s, u2s), df2_x1, modules='numpy')
-        df2_x2_n = sp.lambdify((x1s, x2s, u1s, u2s), df2_x2, modules='numpy')
-
-        # ── 4. Сглаженное лунко-образное управление (зависит от ψ и μ) ──
-        # Это математически зафиксировано теоремой Понтрягина для лунки.
-        def ctrl_smoothed(psi, mu):
-            psi1, psi2 = psi[0], psi[1]
-            n2  = psi1**2 + psi2**2
-            eps = 1e-14
-            A   = max(np.sqrt(mu * n2 + (psi1 + psi2)**2), eps)
-            B   = max(np.sqrt(mu * n2 + (psi1 - psi2)**2), eps)
-            q1  = 0.5 * (A + B)
-            dq1_dpsi1 = 0.5 * ((mu*psi1 + psi1 + psi2) / A +
-                                (mu*psi1 + psi1 - psi2) / B)
-            dq1_dpsi2 = 0.5 * ((mu*psi2 + psi1 + psi2) / A +
-                                (mu*psi2 - psi1 + psi2) / B)
-            R  = max(np.sqrt(q1**2 + psi2**2), eps)
-            s2 = np.sqrt(2.0)
-            u1 = dq1_dpsi1 * (s2 * q1 / R - 1.0)
-            u2 = s2 * (q1 * dq1_dpsi2 + psi2) / R - dq1_dpsi2
-            return np.array([u1, u2])
 
         # ── 5. Список μ ──
         mu_values = self.smooth_param_list
@@ -553,6 +591,8 @@ class SolverThread(QThread):
             else:
                 mu_values = [1.0, 1e-1, 1e-6]
 
+        if not mu_values or any(not np.isfinite(mu) or mu <= 0 for mu in mu_values):
+            raise ValueError('Smoothing parameters must be finite and positive.')
         layers = []
         # Warm-start: derive from user's initial_guess if available, otherwise
         # use a scale derived from the BC magnitudes — no hardcoded values
@@ -570,20 +610,8 @@ class SolverThread(QThread):
                     pass
 
         def make_ode(mu_val):
-            def ode_dimless(tau, y):
-                x1, x2, psi1, psi2, T = y
-                u = ctrl_smoothed(np.array([psi1, psi2]), mu_val)
-                u1v, u2v = float(u[0]), float(u[1])
-                dx1 = T * float(f1_n(x1, x2, u1v, u2v))
-                dx2 = T * float(f2_n(x1, x2, u1v, u2v))
-                a11 = float(df1_x1_n(x1, x2, u1v, u2v))
-                a12 = float(df1_x2_n(x1, x2, u1v, u2v))
-                a21 = float(df2_x1_n(x1, x2, u1v, u2v))
-                a22 = float(df2_x2_n(x1, x2, u1v, u2v))
-                dp1 = -T * (psi1 * a11 + psi2 * a21)
-                dp2 = -T * (psi1 * a12 + psi2 * a22)
-                return [dx1, dx2, dp1, dp2, 0.0]
-            return ode_dimless
+            return lambda tau, y: dynamics.derivative(y, mu_val)
+
 
         def make_shoot(ode_fn):
             def shoot_3(v):
@@ -592,7 +620,9 @@ class SolverThread(QThread):
                     return np.full(3, 1e6)
                 try:
                     sol = solve_ivp(ode_fn, [0., 1.], [a1, a2, p10, p20, Tv],
-                                    rtol=1e-9, atol=1e-12, max_step=0.005)
+                                    method='DOP853', rtol=1e-11, atol=1e-13, max_step=0.005)
+                    if not sol.success:
+                        return np.full(3, 1e10)
                     ye = sol.y[:, -1]
                 except Exception:
                     return np.full(3, 1e10)
@@ -602,17 +632,18 @@ class SolverThread(QThread):
                                  ye[2]**2 + ye[3]**2 - 1.0])
             return shoot_3
 
-        def try_root(ode_fn, start):
+        def try_root(ode_fn, start, maxiter=160):
             shoot_3 = make_shoot(ode_fn)
             try:
                 res = root(shoot_3, start, method='lm',
-                           options={'ftol': 1e-10, 'xtol': 1e-10, 'maxiter': 300})
+                           options={'ftol': 1e-11, 'xtol': 1e-11, 'maxiter': maxiter,
+                                    'eps': 1e-8})
                 if not res.success:
                     return None, np.inf
                 if res.x[2] <= 0:                # reject non-physical T<0
                     return None, np.inf
                 rnorm = float(np.linalg.norm(shoot_3(res.x)))
-                if rnorm > 1.0:
+                if not np.isfinite(rnorm) or rnorm > max(1e-7, 100*self.dataset.tol):
                     return None, rnorm
                 return res.x, rnorm
             except Exception:
@@ -638,14 +669,13 @@ class SolverThread(QThread):
 
         for mu in all_mus:
             ode_main = make_ode(mu)
-            sol_x, rnorm = try_root(ode_main, [psi10, psi20, T_opt])
+            sol_x, rnorm = try_root(ode_main, [psi10, psi20, T_opt], maxiter=120)
 
             # Multistart fallback if main attempt diverged.
             # Trials are generated adaptively from a problem-scale base, so
             # changing BCs or equations produces a different (scaled) search
             # space — no hardcoded numerical constants.
             if sol_x is None:
-                best_x, best_r = None, np.inf
                 base_T = bc_scale * 2.0
                 trials = []
                 for sign_psi in ((-1.0, -1.0), (-1.0, 0.5), (-0.5, -1.0),
@@ -654,31 +684,42 @@ class SolverThread(QThread):
                         trials.append([sign_psi[0] * 0.5, sign_psi[1] * 0.2,
                                        base_T * k])
                 for tr in trials:
-                    cand, r = try_root(ode_main, tr)
-                    if cand is not None and r < best_r:
-                        best_x, best_r = cand, r
-                sol_x, rnorm = best_x, best_r
+                    cand, r = try_root(ode_main, tr, maxiter=300)
+                    if cand is not None:
+                        # Every accepted candidate already satisfies all three
+                        # endpoint conditions.  Minimising residual below the
+                        # tolerance does not identify a more time-optimal
+                        # branch, so continuing all 15 trials only adds delay.
+                        sol_x, rnorm = cand, r
+                        break
 
             if sol_x is not None:
                 psi10, psi20, T_opt = sol_x
                 solutions_cache[mu] = (psi10, psi20, T_opt)
+            else:
+                raise RuntimeError(f'Lens solve failed at mu={mu:g}; boundary residual={rnorm:.3g}')
 
         # Now emit only the originally requested mu_values
         for mu in mu_values:
-            if mu in solutions_cache:
-                psi10, psi20, T_opt = solutions_cache[mu]
+            psi10, psi20, T_opt = solutions_cache[mu]
             ode_main = make_ode(mu)
             _tol = getattr(self.dataset, 'tol', 1e-9)
             _method = getattr(self.dataset, 'method', 'RK45')
             sol = solve_ivp(ode_main, [0., 1.], [a1, a2, psi10, psi20, T_opt],
                             dense_output=True, method=_method,
                             rtol=_tol, atol=_tol * 1e-3, max_step=0.002)
-            t_dimless = np.linspace(0., 1., 300)
+            if not sol.success:
+                raise RuntimeError(sol.message)
+            t_dimless = np.linspace(0., 1., self.dataset.n_points)
             y_dimless = sol.sol(t_dimless)
+            residual = np.r_[y_dimless[:2,-1]-[b1,b2],
+                             np.sum(y_dimless[2:4,-1]**2)-1]
+            if not np.isfinite(y_dimless).all() or np.max(np.abs(residual)) > max(1e-6, 100*_tol):
+                raise RuntimeError(f'Lens trajectory failed endpoint validation at mu={mu:g}')
 
             u_vals = np.zeros((2, len(t_dimless)))
             for i in range(len(t_dimless)):
-                u_vals[:, i] = ctrl_smoothed(y_dimless[2:4, i], mu)
+                u_vals[:, i] = dynamics.control(y_dimless[:2, i], y_dimless[2:4, i], mu)
 
             y_out = np.vstack([
                 y_dimless[0], y_dimless[1],
@@ -689,12 +730,12 @@ class SolverThread(QThread):
 
             # Convert dimensionless τ ∈ [0,1] to real time t = τ·T_opt
             t_real = t_dimless * T_opt
-            layers.append((t_real, y_out, f'T={T_opt:.4f}'))
+            layers.append((t_real, y_out, f'μ={mu:g} · T={T_opt:.6f}'))
 
         if len(layers) == 1:
-            self.finished.emit(layers[0][0], layers[0][1])
+            self.result_ready.emit(layers[0][0], layers[0][1])
         else:
-            self.finished.emit(layers, None)
+            self.result_ready.emit(layers, None)
 
     def run(self):
         try:
@@ -702,7 +743,9 @@ class SolverThread(QThread):
                 problem_type = self.explicit_type
             else:
                 problem_type = detect_problem_type(self.dataset)
-            if problem_type == 'kepler':
+            if problem_type in ('kepler', 'limit_cycle', 'triple') and self.smooth_param_list is not None:
+                self._solve_parameter_values(problem_type)
+            elif problem_type == 'kepler':
                 self._solve_kepler()
             elif problem_type == 'limit_cycle':
                 self._solve_limit_cycles()
@@ -712,7 +755,7 @@ class SolverThread(QThread):
                 self._solve_lens_control()
             else:
                 solver = ContinuationSolver(self.dataset)
-                if self.smooth_param_list and len(self.smooth_param_list) > 1:
+                if self.smooth_param_list:
                     param_name = self.dataset.continuation_param
                     all_vals = sorted(float(v) for v in self.smooth_param_list)
                     dense = []
@@ -730,32 +773,60 @@ class SolverThread(QThread):
                                               lmbda_values=chain)
                         layers.append((xp, yp, None, f'{param_name}={pv:.4g}'))
                     if layers:
-                        self.finished.emit(layers, None)
+                        self.result_ready.emit(layers, None)
                     else:
                         raise RuntimeError("No parameter values converged")
                 else:
                     x_eval, y_eval = solver.solve(self.initial_guess)
-                    self.finished.emit(x_eval, y_eval)
+                    self.result_ready.emit(x_eval, y_eval)
         except Exception as e:
             self.error.emit(str(e))
+
+    def _solve_parameter_values(self, problem_type):
+        """Apply every requested parameter value also to specialised solvers."""
+        from dataclasses import replace
+        values = self.smooth_param_list
+        if not values or not np.isfinite(values).all():
+            raise ValueError('Provide finite continuation parameter values.')
+        layers = []
+        for value in values:
+            ds = replace(self.dataset, parameters={**(self.dataset.parameters or {}),
+                         self.dataset.continuation_param: float(value)})
+            child = SolverThread(ds, self.initial_guess, explicit_type=problem_type,
+                                 multi_cycle=self.multi_cycle)
+            result = {}
+            child.result_ready.connect(lambda t,y: result.update(t=t,y=y))
+            child.error.connect(lambda error: result.update(error=error))
+            child.run()
+            if 'error' in result:
+                raise RuntimeError(result['error'])
+            entries = result['t'] if isinstance(result['t'],list) else [(result['t'],result['y'],None,'')]
+            for entry in entries:
+                full = entry[2] if len(entry)==4 else None
+                label = entry[-1] if isinstance(entry[-1],str) else ''
+                layers.append((entry[0],entry[1],full,
+                               f'{self.dataset.continuation_param}={value:g} {label}'.strip()))
+        self.result_ready.emit(layers,None)
 
 
 class PlotCanvas(FigureCanvas):
     def __init__(self, parent=None, width=10, height=7.5, dpi=120):
-        self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor='#16161A')
+        self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor=SURFACE)
         self.axes = self.fig.add_subplot(111)
-        self.axes.set_facecolor('#16161A')
-        self.axes.tick_params(colors='#9E9EB5', which='both')
+        self.axes.set_facecolor(SURFACE)
+        self.axes.tick_params(colors=MUTED, which='both')
         for spine in self.axes.spines.values():
-            spine.set_color('#35354A')
+            spine.set_color(BORDER)
         super().__init__(self.fig)
         self.setParent(parent)
 
 
 class PlotWindow(QMainWindow):
     def __init__(self, t_data, y_data, varnames, title, parent=None, problem_type='custom',
-                 color_offset=0):
+                 color_offset=0, layer_style_index=None, layer_style_count=None,
+                 initial_x_name=None, initial_y_names=None):
         super().__init__(parent)
+        self.setStyleSheet(STYLESHEET)
         self.setWindowTitle(title)
         self.setGeometry(150, 150, 1100, 800)
         self.dataset_title = title
@@ -764,6 +835,10 @@ class PlotWindow(QMainWindow):
         # Сдвиг индекса палитры: при «разделении» окон каждый слой сохраняет
         # тот же цвет, что и в совмещённом графике (см. _toggle_split_view).
         self._color_offset = color_offset
+        self._layer_style_index = layer_style_index
+        self._layer_style_count = layer_style_count
+        self._initial_x_name = initial_x_name
+        self._initial_y_names = initial_y_names
 
         if isinstance(t_data, list):
             self._has_layers = True
@@ -791,6 +866,15 @@ class PlotWindow(QMainWindow):
             self._list_vars = []
             self._build_ui(t_data, y_data, varnames)
 
+        if initial_x_name in self._x_items:
+            self._x_idx = self._x_items.index(initial_x_name)
+            self.btn_x.setText(initial_x_name)
+        if initial_y_names:
+            selected = [self._y_items.index(name) for name in initial_y_names
+                        if name in self._y_items]
+            if selected:
+                self._y_indices = selected
+                self.btn_y.setText(", ".join(self._y_items[i] for i in selected))
         self._redraw()
 
     def _build_ui(self, t_data, y_data, varnames):
@@ -839,6 +923,7 @@ class PlotWindow(QMainWindow):
 
         self._x_name_to_row = {}
         self._x_items = ["t"]
+        self._dimensionless_x_index = None
         if isinstance(y_data, np.ndarray) and y_data.ndim == 2:
             nv = y_data.shape[0]
             if varnames and len(varnames) == nv:
@@ -850,6 +935,9 @@ class PlotWindow(QMainWindow):
                 for vi in range(nv):
                     self._x_name_to_row[vi + 1] = vi
                     self._x_items.append(f"x{vi+1}")
+        if self.problem_type == 'lens':
+            self._dimensionless_x_index = len(self._x_items)
+            self._x_items.append('τ')
 
         self._y_items = []
         self._y_row = {-1: -1}
@@ -869,6 +957,9 @@ class PlotWindow(QMainWindow):
         if is_phase:
             self._x_idx = 1
             self._y_indices = [1]
+        elif self.problem_type == 'lens' and self._dimensionless_x_index is not None:
+            self._x_idx = self._dimensionless_x_index
+            self._y_indices = [0]
         else:
             self._x_idx = 0
             self._y_indices = [0]
@@ -937,6 +1028,8 @@ class PlotWindow(QMainWindow):
         vn = self.varnames
         layers = self._list_data
         new_windows = []
+        selected_x = self._x_items[self._x_idx]
+        selected_y = [self._y_items[index] for index in self._y_indices]
         for i, layer in enumerate(layers):
             if not isinstance(layer, (list, tuple)):
                 continue
@@ -958,7 +1051,10 @@ class PlotWindow(QMainWindow):
             packed = [(t_i, y_i, full_i, label_i or f'#{i+1}')]
             # color_offset=i → слой сохраняет свой цвет из совмещённого графика.
             w = PlotWindow(packed, None, vn, title_i, mw, self.problem_type,
-                           color_offset=i)
+                           color_offset=i, layer_style_index=i,
+                           layer_style_count=len(layers),
+                           initial_x_name=selected_x,
+                           initial_y_names=selected_y)
             w.setGeometry(150 + 40 * i, 150 + 40 * i, 1000, 700)
             w.show()
             new_windows.append(w)
@@ -970,8 +1066,14 @@ class PlotWindow(QMainWindow):
     def _redraw(self):
         ax = self.canvas.axes
         ax.clear()
+        ax.set_facecolor(SURFACE)
+        ax.tick_params(colors=MUTED)
+        for spine in ax.spines.values():
+            spine.set_color(BORDER)
 
         xi = self._x_idx
+        is_dimensionless = (self._dimensionless_x_index is not None and
+                            xi == self._dimensionless_x_index)
 
         if self._has_layers:
             layers = self._list_data
@@ -986,7 +1088,8 @@ class PlotWindow(QMainWindow):
         off = getattr(self, '_color_offset', 0)
 
         all_x, all_y = [], []
-        x_label = "t" if xi == 0 else self._x_items[xi]
+        drawn_curves = []
+        x_label = 'τ=t/T' if is_dimensionless else ("t" if xi == 0 else self._x_items[xi])
         y_label = ""
 
         for yi_pos, yi in enumerate(self._y_indices):
@@ -1009,13 +1112,19 @@ class PlotWindow(QMainWindow):
                     # T is stored in y_dat[2] (the period variable)
                     t_scale = float(y_dat[2, 0])
                 t_plot = t_dat * t_scale
+                if is_dimensionless:
+                    span = float(t_dat[-1] - t_dat[0])
+                    t_axis = ((t_dat - t_dat[0]) / span if span else
+                              np.zeros_like(t_dat, dtype=float))
+                else:
+                    t_axis = t_plot
 
                 if len(self._y_indices) == 1:
                     c = colors[(li + off) % len(colors)]
                 else:
                     c = colors[(yi_pos * len(layers) + li + off) % len(colors)]
 
-                if has_full and self._has_layers and len(self._y_indices) == 1:
+                if has_full and xi > 0 and self._has_layers and len(self._y_indices) == 1:
                     full_y = entry[2]
                     n_full = full_y.shape[1]
                     if xi == 0:
@@ -1031,18 +1140,38 @@ class PlotWindow(QMainWindow):
                     ax.plot(full_x, full_yv, color=c,
                             lw=1.2, ls='--', alpha=0.55)
 
-                xx = t_plot if xi == 0 else y_dat[x_row]
+                xx = t_axis if (xi == 0 or is_dimensionless) else y_dat[x_row]
                 yy = t_plot if y_row < 0 else y_dat[y_row]
 
                 all_x.extend(xx); all_y.extend(yy)
 
-                if is_phase:
-                    ax.plot(xx, yy, color=c, lw=2, label=label)
-                    ax.plot(xx[0], yy[0], 'o', color=c, ms=6)
-                elif len(self._y_indices) > 1:
-                    ax.plot(xx, yy, color=c, lw=2, label=f'{label}: {y_name}')
+                # All computed curves are solid unless a sustained segment
+                # overlaps a curve already drawn in this same axes.  A single
+                # crossing is not an overlap.  Reference/full orbits remain a
+                # separate dashed background convention.
+                # The textbook examples 26.3 (triple) and 26.4 (lens) use
+                # solid computed curves throughout.  Do not split their
+                # control/costate or μ layers into dashed overlap segments.
+                if self.problem_type in ('triple', 'lens'):
+                    overlap_mask = np.zeros(np.asarray(yy).shape, dtype=bool)
                 else:
-                    ax.plot(xx, yy, color=c, lw=2, label=label)
+                    overlap_mask = _curve_overlap_mask(xx, yy, drawn_curves)
+                curve_label = (label if (is_phase or len(self._y_indices) == 1)
+                               else f'{label}: {y_name}')
+                solid_mask = ~overlap_mask
+                label_used = False
+                if np.any(solid_mask):
+                    solid_y = np.where(solid_mask, yy, np.nan)
+                    ax.plot(xx, solid_y, color=c, lw=2, ls='-',
+                            label=curve_label)
+                    label_used = True
+                if np.any(overlap_mask):
+                    dashed_y = np.where(overlap_mask, yy, np.nan)
+                    ax.plot(xx, dashed_y, color=c, lw=2, ls='--',
+                            label='_nolegend_' if label_used else curve_label)
+                if is_phase:
+                    ax.plot(xx[0], yy[0], 'o', color=c, ms=6)
+                drawn_curves.append((np.asarray(xx), np.asarray(yy)))
 
         if is_phase and xi == 1 and any(self._y_row.get(yi, -1) == 1 for yi in self._y_indices):
             origin_lbl = 'центр (0, 0)' if self.problem_type == 'kepler' else 'начало (0, 0)'
@@ -1054,18 +1183,18 @@ class PlotWindow(QMainWindow):
             y_label = ", ".join(self._y_items[i] for i in self._y_indices)
 
         if is_phase:
-            ax.set_xlabel(x_label, color='#9E9EB5'); ax.set_ylabel(y_label, color='#9E9EB5')
+            ax.set_xlabel(x_label, color=MUTED); ax.set_ylabel(y_label, color=MUTED)
             ax.set_aspect('equal')
         else:
-            ax.set_xlabel(x_label, color='#9E9EB5'); ax.set_ylabel(y_label, color='#9E9EB5')
+            ax.set_xlabel(x_label, color=MUTED); ax.set_ylabel(y_label, color=MUTED)
         if ax.get_legend_handles_labels()[0]:
-            leg = ax.legend(prop={'size': 9}, facecolor='#1C1C24',
-                           edgecolor='#2E2E3A', labelcolor='#D9D9E3')
+            leg = ax.legend(prop={'size': 9}, facecolor=SURFACE,
+                           edgecolor=BORDER, labelcolor=TEXT)
             leg.get_frame().set_alpha(0.92)
 
-        ax.axhline(y=0, color='#35354A', linewidth=1.2, zorder=0)
-        ax.axvline(x=0, color='#35354A', linewidth=1.2, zorder=0)
-        ax.grid(True, alpha=0.18, linewidth=0.5, color='#4A4A65')
+        ax.axhline(y=0, color=BORDER, linewidth=0.8, zorder=0)
+        ax.axvline(x=0, color=BORDER, linewidth=0.8, zorder=0)
+        ax.grid(True, alpha=0.55, linewidth=0.5, color=BORDER)
 
         m = 0.15
         if all_x and all_y:
@@ -1105,6 +1234,8 @@ class MainWindow(QMainWindow):
             'unknowns': 'Unknowns:',
             'controls': 'Controls',
             'ready': 'Ready',
+            'advanced': 'Solver settings',
+            'changed': 'Inputs changed — solve again',
             'computing': 'Computing...',
             'done': 'Done',
             'error': 'Error',
@@ -1178,6 +1309,8 @@ class MainWindow(QMainWindow):
             'unknowns': 'Неизвестные:',
             'controls': 'Управление',
             'ready': 'Готов',
+            'advanced': 'Настройки решателя',
+            'changed': 'Данные изменены — решите задачу снова',
             'computing': 'Вычисление...',
             'done': 'Готово',
             'error': 'Ошибка',
@@ -1235,7 +1368,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.lang = 'ru'
-        self.setGeometry(100, 100, 1180, 980)
+        self.setGeometry(100, 100, 1180, 820)
+        self._input_revision = 0
+        self._pending_revision = None
+        self._solving = False
 
         self.current_dataset = None
         self.solver_thread = None
@@ -1253,6 +1389,10 @@ class MainWindow(QMainWindow):
         self.apply_style()
         self.apply_language()
         self._load_history()
+        self._connect_input_changes()
+        self.set_dataset_to_ui(get_example_tasks()[0])
+        self._set_status(self._tr('ready'), 'ready')
+        self.graph_btn.setEnabled(False)
 
     def _tr(self, key):
         return self.TR.get(self.lang, self.TR['ru']).get(key, key)
@@ -1267,6 +1407,7 @@ class MainWindow(QMainWindow):
     def apply_language(self):
         self.setWindowTitle(self._tr('title'))
         self.header_title.setText(self._tr('title'))
+        self.header_subtitle.setText('Краевые задачи · SymPy + SciPy' if self.lang == 'ru' else 'Boundary-value problems · SymPy + SciPy')
         self.params_group.setTitle(self._tr('params'))
         self.lbl_dim.setText(self._tr('dim'))
         self.lbl_a.setText(self._tr('a'))
@@ -1284,6 +1425,11 @@ class MainWindow(QMainWindow):
         self.bc_edit.setPlaceholderText(self._tr('bc_placeholder'))
         self.init_group.setTitle(self._tr('init_guess'))
         self.lbl_unknowns.setText(self._tr('unknowns'))
+        self.adv_toggle.setText(('▲ ' if self.adv_toggle.isChecked() else '▼ ') + self._tr('advanced'))
+        self.guess_hint.setText(
+            'Граничные условия задают задачу. Начальное приближение может сходиться к тому же решению.'
+            if self.lang == 'ru' else
+            'Boundary conditions define the problem. Different guesses can converge to the same solution.')
         self.control_group.setTitle(self._tr('controls'))
         self.solve_btn.setText(self._tr('solve'))
         self.graph_btn.setText(self._tr('graph'))
@@ -1291,15 +1437,16 @@ class MainWindow(QMainWindow):
         self.clear_btn.setText(self._tr('clear'))
         self.load_btn.setText(self._tr('load'))
         self.example_btn.setText(self._tr('examples'))
+        method_index = max(0, self.sol_method_combo.currentIndex())
+        self.sol_method_combo.blockSignals(True)
         self.sol_method_combo.clear()
         self.sol_method_combo.addItems(self._tr('sol_method_items'))
+        self.sol_method_combo.setCurrentIndex(method_index)
+        self.sol_method_combo.blockSignals(False)
         for i, ed in enumerate(self.equation_edits):
             ed.setPlaceholderText(self._tr('eq_placeholder'))
         state = getattr(self, '_status_state', 'ready')
-        if state == 'computing':
-            self._set_status(self._tr('computing'), 'computing')
-        else:
-            self._set_status(self._tr('ready'), 'ready')
+        self._set_status(self._tr(state), state)
         self.history_group.setTitle(self._tr('history'))
         self.btn_lang.setText(self._tr('lang_label'))
         self.btn_about.setText(self._tr('about'))
@@ -1348,15 +1495,24 @@ class MainWindow(QMainWindow):
         return [v.strip() for v in text.split(',')]
 
     def _derivative_to_ddt(self, eq_str, varnames):
+        direct = re.match(
+            r'^\s*Derivative\(x(\d+)\((\w+)\),\s*(\w+)\)\s*=\s*(.*?)\s*$',
+            eq_str)
+        if direct:
+            idx = int(direct.group(1)) - 1
+            rhs = direct.group(4).strip()
+            mapping = {f'x{i+1}': vn for i, vn in enumerate(varnames)}
+            rhs = re.sub(r'\b\w+\b', lambda match: mapping.get(match[0], match[0]), rhs)
+            return f'd/dt[{idx}]: {rhs}'
         m = re.match(r'Derivative\(x(\d+)\((\w+)\),\s*(\w+)\)\s*([+-])\s*(.*?)\s*=\s*0$', eq_str)
         if m:
             idx = int(m.group(1)) - 1
             op = m.group(4)
             rhs = m.group(5).strip()
             if op == '+':
-                rhs = '-' + rhs
-            for i, vn in enumerate(varnames):
-                rhs = re.sub(r'\b' + re.escape('x' + str(i+1)) + r'\b', vn, rhs)
+                rhs = '-(' + rhs + ')'
+            mapping = {f'x{i+1}': vn for i, vn in enumerate(varnames)}
+            rhs = re.sub(r'\b\w+\b', lambda m: mapping.get(m[0], m[0]), rhs)
             return f'd/dt[{idx}]: {rhs}'
         m2 = re.match(r'Derivative\(x(\d+)\((\w+)\),\s*(\w+)\)\s*=\s*0$', eq_str)
         if m2:
@@ -1376,386 +1532,33 @@ class MainWindow(QMainWindow):
         if rhs == '0':
             return f'Derivative(x{idx+1}(t), t) = 0'
         rhs_x = rhs
-        for i, vn in enumerate(varnames):
-            if vn:
-                rhs_x = re.sub(r'\b' + re.escape(vn) + r'\b', 'x' + str(i+1), rhs_x)
-        if rhs_x.startswith('-'):
-            return f'Derivative(x{idx+1}(t), t) + {rhs_x[1:].strip()} = 0'
-        return f'Derivative(x{idx+1}(t), t) - {rhs_x} = 0'
+        mapping = {vn: f'x{i+1}' for i, vn in enumerate(varnames) if vn}
+        rhs_x = re.sub(r'\b\w+\b', lambda m: mapping.get(m[0], m[0]), rhs)
+        return f'Derivative(x{idx+1}(t), t) - ({rhs_x}) = 0'
 
     def apply_style(self):
-        """Refined dark theme — onyx background, soft sapphire accents, clean geometry."""
-        self.setStyleSheet("""
-            QMainWindow, QDialog {
-                background-color: #16161A;
-            }
-            QWidget {
-                font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
-                font-size: 9.5pt;
-                color: #D9D9E3;
-                background-color: #16161A;
-            }
-
-            /* ── Header ── */
-            QFrame#headerFrame {
-                background-color: #0F0F14;
-                border: none;
-                border-bottom: 1px solid #2A2A35;
-            }
-            QLabel#headerTitle {
-                color: #E2E2EE;
-                font-size: 15pt;
-                font-weight: 700;
-                background: transparent;
-                letter-spacing: 0.3px;
-            }
-
-            /* ── GroupBox — card with top accent bar ── */
-            QGroupBox {
-                background-color: #1C1C24;
-                border: 1px solid #2E2E3A;
-                border-top: 2px solid #7AA2F7;
-                border-radius: 10px;
-                margin-top: 18px;
-                padding: 16px 14px 14px 14px;
-                font-weight: 700;
-                font-size: 10pt;
-                color: #C5C5D8;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 14px;
-                padding: 2px 12px;
-                color: #7AA2F7;
-                background-color: #1C1C24;
-                font-size: 10pt;
-                font-weight: 700;
-                letter-spacing: 0.3px;
-            }
-            QGroupBox QLabel {
-                background-color: transparent;
-                color: #9E9EB5;
-            }
-            QGroupBox QCheckBox {
-                background-color: transparent;
-            }
-
-            /* ── Inputs ── */
-            QLineEdit, QTextEdit, QPlainTextEdit {
-                background-color: #121218;
-                border: 1px solid #35354A;
-                border-radius: 7px;
-                padding: 7px 10px;
-                color: #D9D9E3;
-                font-family: "Cascadia Code", "Consolas", monospace;
-                font-size: 9pt;
-                selection-background-color: #3B5F9E;
-                selection-color: #E2E8F0;
-            }
-            QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
-                border-color: #7AA2F7;
-                background-color: #121218;
-            }
-            QLineEdit:hover, QTextEdit:hover {
-                border-color: #4A4A65;
-            }
-
-            QSpinBox, QDoubleSpinBox {
-                background-color: #121218;
-                border: 1px solid #35354A;
-                border-radius: 7px;
-                padding: 4px 7px;
-                color: #D9D9E3;
-                font-family: "Cascadia Code", "Consolas", monospace;
-                font-size: 9pt;
-            }
-            QSpinBox:focus, QDoubleSpinBox:focus { border-color: #7AA2F7; }
-            QSpinBox:hover, QDoubleSpinBox:hover { border-color: #4A4A65; }
-
-            QComboBox {
-                background-color: #121218;
-                border: 1px solid #35354A;
-                border-radius: 7px;
-                padding: 5px 10px;
-                color: #D9D9E3;
-                font-family: "Cascadia Code", "Consolas", monospace;
-                font-size: 9pt;
-            }
-            QComboBox:focus { border-color: #7AA2F7; }
-            QComboBox:hover { border-color: #4A4A65; }
-            QComboBox::drop-down {
-                subcontrol-origin: padding;
-                subcontrol-position: right;
-                width: 22px;
-                border-left: 1px solid #2E2E3A;
-                border-top-right-radius: 7px;
-                border-bottom-right-radius: 7px;
-                background: #24243A;
-            }
-            QComboBox QAbstractItemView {
-                background: #1C1C24;
-                border: 1px solid #2E2E3A;
-                border-radius: 6px;
-                selection-background-color: rgba(122, 162, 247, 0.16);
-                selection-color: #C5D5FB;
-                color: #D9D9E3;
-                padding: 4px;
-                outline: none;
-            }
-
-            /* ── Primary button ── */
-            QPushButton {
-                background-color: #3B5F9E;
-                color: #E2E8F0;
-                border: none;
-                border-radius: 7px;
-                padding: 8px 22px;
-                font-size: 9.5pt;
-                font-weight: 700;
-                letter-spacing: 0.2px;
-            }
-            QPushButton:hover { background-color: #4A75C0; }
-            QPushButton:pressed { background-color: #2E4D85; }
-            QPushButton:disabled {
-                background-color: #24242E;
-                color: #505065;
-            }
-
-            /* ── Solve — warm green ── */
-            QPushButton#solveBtn {
-                background-color: #3B8C5A;
-                color: #E5F5EA;
-                border-radius: 8px;
-                font-size: 11pt;
-                font-weight: 800;
-                padding: 11px 30px;
-                letter-spacing: 0.6px;
-            }
-            QPushButton#solveBtn:hover { background-color: #4CA86F; }
-            QPushButton#solveBtn:pressed { background-color: #2E7045; }
-            QPushButton#solveBtn:disabled {
-                background-color: #24242E;
-                color: #505065;
-            }
-
-            /* ── Secondary / outline ── */
-            QPushButton#secondaryBtn {
-                background: transparent;
-                color: #7AA2F7;
-                border: 1.5px solid #35354A;
-                border-radius: 7px;
-                padding: 6px 16px;
-                font-size: 9pt;
-                font-weight: 600;
-            }
-            QPushButton#secondaryBtn:hover {
-                background-color: rgba(122, 162, 247, 0.08);
-                border-color: #7AA2F7;
-                color: #A8C4FB;
-            }
-
-            /* ── Header pill buttons ── */
-            QPushButton#headerBtn {
-                background: transparent;
-                color: #7AA2F7;
-                border: 1.5px solid #35354A;
-                border-radius: 8px;
-                padding: 6px 16px;
-                font-size: 9.5pt;
-                font-weight: 600;
-            }
-            QPushButton#headerBtn:hover {
-                background-color: rgba(122, 162, 247, 0.08);
-                border-color: #7AA2F7;
-                color: #A8C4FB;
-            }
-
-            /* ── Plot toolbar ── */
-            QPushButton#plotToolBtn {
-                background: transparent;
-                color: #7AA2F7;
-                border: 1.5px solid #35354A;
-                border-radius: 7px;
-                padding: 5px 14px;
-                font-size: 9pt;
-                font-weight: 600;
-            }
-            QPushButton#plotToolBtn:hover {
-                background-color: rgba(122, 162, 247, 0.08);
-                border-color: #7AA2F7;
-            }
-
-            /* ── CheckBox ── */
-            QCheckBox {
-                color: #C5C5D8;
-                spacing: 9px;
-                font-size: 9.5pt;
-                background: transparent;
-            }
-            QCheckBox::indicator {
-                width: 17px;
-                height: 17px;
-                border-radius: 4px;
-                border: 1.5px solid #4A4A65;
-                background: #121218;
-            }
-            QCheckBox::indicator:checked {
-                background: #7AA2F7;
-                border-color: #7AA2F7;
-            }
-            QCheckBox::indicator:hover { border-color: #7AA2F7; }
-
-            /* ── Tabs ── */
-            QTabWidget::pane {
-                border: 1px solid #2E2E3A;
-                border-radius: 8px;
-                background: #16161A;
-            }
-            QTabBar::tab {
-                background: #1C1C24;
-                color: #9E9EB5;
-                border: 1px solid #2E2E3A;
-                padding: 9px 20px;
-                margin-right: 3px;
-                border-top-left-radius: 7px;
-                border-top-right-radius: 7px;
-            }
-            QTabBar::tab:selected {
-                background: #16161A;
-                color: #7AA2F7;
-                border-bottom-color: #16161A;
-            }
-            QTabBar::tab:hover { background: #24243A; }
-
-            /* ── Scrollbar ── */
-            QScrollArea { border: none; background: transparent; }
-            QScrollBar:vertical {
-                background: transparent;
-                width: 9px;
-                border-radius: 4px;
-                margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: #35354A;
-                border-radius: 4px;
-                min-height: 32px;
-            }
-            QScrollBar::handle:vertical:hover { background: #4A4A65; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-            QScrollBar:horizontal {
-                background: transparent;
-                height: 9px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #35354A;
-                border-radius: 4px;
-                min-width: 32px;
-            }
-            QScrollBar::handle:horizontal:hover { background: #4A4A65; }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-
-            /* ── List ── */
-            QListWidget {
-                background: #121218;
-                border: 1px solid #2E2E3A;
-                border-radius: 9px;
-                font-size: 9pt;
-                color: #D9D9E3;
-                outline: none;
-                padding: 5px;
-            }
-            QListWidget::item {
-                padding: 8px 14px;
-                border-radius: 5px;
-                margin: 1px 0;
-            }
-            QListWidget::item:hover { background: #24243A; }
-            QListWidget::item:selected {
-                background: rgba(122, 162, 247, 0.14);
-                color: #C5D5FB;
-            }
-
-            /* ── Menu ── */
-            QMenu {
-                background: #1C1C24;
-                border: 1px solid #2E2E3A;
-                border-radius: 9px;
-                padding: 6px;
-                color: #D9D9E3;
-            }
-            QMenu::item {
-                padding: 8px 22px;
-                border-radius: 5px;
-            }
-            QMenu::item:selected {
-                background: rgba(122, 162, 247, 0.14);
-                color: #A8C4FB;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #2E2E3A;
-                margin: 5px 10px;
-            }
-
-            /* ── Tooltip ── */
-            QToolTip {
-                background: #24243A;
-                color: #D9D9E3;
-                border: 1px solid #35354A;
-                border-radius: 7px;
-                padding: 7px 12px;
-                font-size: 9pt;
-            }
-
-            /* ── Dialogs ── */
-            QDialogButtonBox QPushButton { min-width: 85px; }
-            QPlainTextEdit {
-                background-color: #121218;
-                border: 1px solid #35354A;
-                border-radius: 7px;
-                padding: 8px;
-                color: #D9D9E3;
-                font-family: "Cascadia Code", "Consolas", monospace;
-                font-size: 9pt;
-            }
-            QPlainTextEdit:focus { border-color: #7AA2F7; }
-
-            /* ── QTextEdit in group boxes ── */
-            QGroupBox QTextEdit {
-                background-color: #121218;
-                border: 1px solid #35354A;
-                border-radius: 7px;
-                padding: 6px;
-                color: #D9D9E3;
-                font-family: "Cascadia Code", "Consolas", monospace;
-                font-size: 9pt;
-            }
-            QGroupBox QTextEdit:focus { border-color: #7AA2F7; }
-        """)
+        self.setStyleSheet(STYLESHEET)
 
     def _create_header(self):
-        """Light header bar with title and top-level pill buttons.
-
-        Style: warm-white background, indigo accent, soft bottom border.
-        """
+        """Compact navigation bar with title, context and utility menus."""
         frame = QFrame()
         frame.setObjectName("headerFrame")
-        frame.setFixedHeight(64)
+        frame.setFixedHeight(70)
         layout = QHBoxLayout(frame)
         layout.setContentsMargins(24, 0, 18, 0)
         layout.setSpacing(10)
 
-        # Small decorative dot for visual interest
-        dot = QLabel()
-        dot.setFixedSize(10, 10)
-        dot.setStyleSheet("background: #7AA2F7; border-radius: 5px;")
-        layout.addWidget(dot)
-        layout.addSpacing(6)
-
+        title_box = QWidget()
+        title_layout = QVBoxLayout(title_box)
+        title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(0)
         self.header_title = QLabel()
         self.header_title.setObjectName("headerTitle")
-        layout.addWidget(self.header_title)
+        title_layout.addWidget(self.header_title)
+        self.header_subtitle = QLabel('BVP solver · SymPy + SciPy')
+        self.header_subtitle.setObjectName('headerSubtitle')
+        title_layout.addWidget(self.header_subtitle)
+        layout.addWidget(title_box)
         layout.addStretch()
 
         self.btn_lang = QPushButton()
@@ -1779,25 +1582,33 @@ class MainWindow(QMainWindow):
         return frame
 
     def _set_status(self, text, state='ready'):
-        """Pill-shaped status badge tinted for the dark theme."""
+        """Small text status; reserve strong emphasis for the solve button."""
         self._status_state = state
-        _pal = {
-            'ready':     'color:#9E9EB5;background:#1C1C24;'
-                         'border:1px solid #35354A;',
-            'computing': 'color:#7AA2F7;background:rgba(122,162,247,0.10);'
-                         'border:1px solid #7AA2F7;',
-            'done':      'color:#6FCF97;background:rgba(111,207,151,0.10);'
-                         'border:1px solid #6FCF97;',
-            'error':     'color:#F7768E;background:rgba(247,118,142,0.09);'
-                         'border:1px solid #F7768E;',
-            'cancelled': 'color:#E0AF68;background:rgba(224,175,104,0.09);'
-                         'border:1px solid #E0AF68;',
-        }
-        base = ('border-radius:13px;padding:5px 22px;'
-                'font-weight:700;font-size:9.5pt;text-align:center;'
-                'letter-spacing:0.4px;')
-        self.status_label.setStyleSheet(base + _pal.get(state, _pal['ready']))
+        color = {'computing': '#3865D9', 'done': '#24744B',
+                 'error': '#B34343', 'changed': '#98651F'}.get(state, MUTED)
+        self.status_label.setStyleSheet(f'color:{color};padding:4px;background:transparent;')
         self.status_label.setText(text)
+
+    def _connect_input_changes(self):
+        """Connect current editors, including controls created after dimension changes."""
+        for cls, signal in ((QLineEdit, 'textChanged'), (QTextEdit, 'textChanged'),
+                            (QSpinBox, 'valueChanged'), (QDoubleSpinBox, 'valueChanged'),
+                            (QComboBox, 'currentIndexChanged'), (QCheckBox, 'toggled')):
+            for widget in self.centralWidget().findChildren(cls):
+                if not widget.property('invalidatesResult'):
+                    getattr(widget, signal).connect(self._on_input_changed)
+                    widget.setProperty('invalidatesResult', True)
+
+    def _clear_result(self):
+        self._last_x = self._last_y = None
+        self.graph_btn.setEnabled(False)
+        self._close_plot_windows()
+
+    def _on_input_changed(self, *args):
+        self._input_revision += 1
+        self._clear_result()
+        if not self._solving:
+            self._set_status(self._tr('changed'), 'changed')
 
     def init_ui(self):
         central_widget = QWidget()
@@ -1812,43 +1623,40 @@ class MainWindow(QMainWindow):
         # ── Main body ──
         body = QWidget()
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(10, 8, 10, 8)
+        body_layout.setContentsMargins(20, 14, 20, 18)
         body_layout.setSpacing(0)
 
         split = QHBoxLayout()
-        split.setSpacing(8)
+        split.setSpacing(18)
         split.addWidget(self.create_left_panel(), 3)
         split.addWidget(self.create_right_panel(), 2)
         body_layout.addLayout(split)
-        outer_layout.addWidget(body)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(body)
+        outer_layout.addWidget(scroll)
 
     def create_left_panel(self):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 2, 4, 2)
-        layout.setSpacing(6)
+        layout.setSpacing(12)
         layout.addWidget(self.create_params_group())
         layout.addWidget(self.create_equation_group())
-        layout.addWidget(self.create_initial_guess_group())
-        layout.addWidget(self.create_solve_group())
         layout.addStretch()
         return panel
 
     def _auto_fit_window(self):
-        """Resize the window so that all content is visible without scrolling."""
-        n_dim = len(self.equation_edits)
-        adv_open = self.adv_widget.isVisible() if hasattr(self, 'adv_widget') else False
-        header = 64
-        params = 130 + (40 if adv_open else 0)
-        eq_group = 70 + 32 * n_dim
-        init = 30 + 34 * n_dim + 32
-        solve = 160
-        margins = 30
-        needed_h = header + params + eq_group + init + solve + margins
-        clamped = max(680, min(1050, needed_h))
-        self.resize(self.width(), clamped)
+        # The scroll area handles long systems without moving/resizing the window.
+        self.updateGeometry()
 
     def create_right_panel(self):
+        panel = QWidget()
+        column = QVBoxLayout(panel)
+        column.setContentsMargins(0, 2, 0, 2)
+        column.setSpacing(12)
+        column.addWidget(self.create_initial_guess_group())
+        column.addWidget(self.create_solve_group())
         self.history_group = QGroupBox()
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
@@ -1858,7 +1666,10 @@ class MainWindow(QMainWindow):
         self.history_list.setToolTip("Previously solved tasks — click to reload")
         layout.addWidget(self.history_list)
         self.history_group.setLayout(layout)
-        return self.history_group
+        self.history_list.setMaximumHeight(100)
+        column.addWidget(self.history_group)
+        column.addStretch()
+        return panel
 
     def create_params_group(self):
         self.params_group = QGroupBox()
@@ -1881,7 +1692,7 @@ class MainWindow(QMainWindow):
         self.x_start_spin = QDoubleSpinBox()
         self.x_start_spin.setRange(-1000, 1000)
         self.x_start_spin.setValue(0.0)
-        self.x_start_spin.setDecimals(3)
+        self.x_start_spin.setDecimals(12)
         self.x_start_spin.setFixedWidth(75)
         self.x_start_spin.setToolTip("Start of integration interval")
         row1.addWidget(self.x_start_spin)
@@ -1890,7 +1701,7 @@ class MainWindow(QMainWindow):
         self.x_end_spin = QDoubleSpinBox()
         self.x_end_spin.setRange(-1000, 1000)
         self.x_end_spin.setValue(7.0)
-        self.x_end_spin.setDecimals(3)
+        self.x_end_spin.setDecimals(12)
         self.x_end_spin.setFixedWidth(75)
         self.x_end_spin.setToolTip("End of integration interval (must be > a)")
         row1.addWidget(self.x_end_spin)
@@ -1923,9 +1734,9 @@ class MainWindow(QMainWindow):
         row2 = QHBoxLayout()
         self.lbl_eps = QLabel()
         row2.addWidget(self.lbl_eps)
-        self.eps_spin = QDoubleSpinBox()
+        self.eps_spin = ScientificDoubleSpinBox()
         self.eps_spin.setRange(1e-14, 1.0)
-        self.eps_spin.setDecimals(12)
+        self.eps_spin.setDecimals(14)
         self.eps_spin.setValue(1e-9)
         self.eps_spin.setFixedWidth(105)
         self.eps_spin.setToolTip("ODE solver tolerance (default 1e‑9)")
@@ -1969,6 +1780,8 @@ class MainWindow(QMainWindow):
             "• Auto — detect from equations/BCs\n"
             "• Continuation — generic shooting\n"
             "• Kepler / Limit cycles / Triple / Lens — specialised solvers")
+        self.sol_method_combo.currentIndexChanged.connect(
+            self._update_multi_cycle_visibility)
         row3.addWidget(self.sol_method_combo)
         row3.addStretch()
         adv_layout.addLayout(row3)
@@ -1981,7 +1794,7 @@ class MainWindow(QMainWindow):
 
     def _on_advanced_toggled(self, checked):
         self.adv_widget.setVisible(checked)
-        self.adv_toggle.setText("▲ Advanced" if checked else "▼ Advanced")
+        self.adv_toggle.setText(('▲ ' if checked else '▼ ') + self._tr('advanced'))
         self._auto_fit_window()
 
     def create_equation_group(self):
@@ -2026,7 +1839,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lbl_bc_label)
         self.bc_edit = QTextEdit()
         self.bc_edit.setPlaceholderText("x1(a) = 2\nx2(a) = 0\nx1(b) = 1.07\nx2(b) = -1.10")
-        self.bc_edit.setFixedHeight(65)
+        self.bc_edit.setMinimumHeight(130)
         self.bc_edit.setToolTip("Boundary conditions in the form  xi(a)=val  or  xi(b)=val, one per line")
         layout.addWidget(self.bc_edit)
 
@@ -2077,6 +1890,10 @@ class MainWindow(QMainWindow):
         # Re-connect visibility signals to the new editors
         for ed in self.equation_edits:
             ed.textChanged.connect(self._update_multi_cycle_visibility)
+        if hasattr(self, 'ic_grid'):
+            self._rebuild_initial_values(new_dim)
+            self._connect_input_changes()
+            self._on_input_changed()
         self._update_multi_cycle_visibility()
         self._auto_fit_window()
 
@@ -2087,26 +1904,10 @@ class MainWindow(QMainWindow):
 
         self.ic_known = []
         self.ic_value = []
-        n = 4
-        grid = QGridLayout()
-        grid.setSpacing(2)
-        for i in range(n):
-            name = f'x{i+1}'
-            cb = QCheckBox(f"{name}(a) known")
-            cb.setChecked(i % 2 == 0)
-            cb.setToolTip(f"Checked → use spinbox value; unchecked → pull from guess list below")
-            self.ic_known.append(cb)
-            grid.addWidget(cb, i, 0)
-
-            sp = QDoubleSpinBox()
-            sp.setRange(-1000, 1000)
-            sp.setDecimals(6)
-            sp.setValue([2.0, -0.5, 0.0, 0.5][i])
-            sp.setFixedWidth(85)
-            sp.setToolTip(f"Initial value for {name}(a) — used only when checkbox is checked")
-            self.ic_value.append(sp)
-            grid.addWidget(sp, i, 1)
-        layout.addLayout(grid)
+        self.ic_grid = QGridLayout()
+        self.ic_grid.setSpacing(5)
+        self._rebuild_initial_values(self.dim_spin.value())
+        layout.addLayout(self.ic_grid)
 
         guess_row = QHBoxLayout()
         self.lbl_unknowns = QLabel()
@@ -2120,15 +1921,48 @@ class MainWindow(QMainWindow):
         guess_row.addWidget(self.guess_edit)
         layout.addLayout(guess_row)
 
-        self.multi_cycle_cb = QCheckBox("Multiple cycles")
+        # Kept as an internal compatibility object for old code/tests, but it
+        # is deliberately not added to the layout.  The number of requested
+        # cycles is derived from the amplitude list, never from hidden state.
+        self.multi_cycle_cb = QCheckBox("Multiple cycles", self.init_group)
         self.multi_cycle_cb.setToolTip(
             "Check to split the guess values into groups of unknowns "
-            "→ each group yields a separate cycle overlaid on one plot.")
+            "→ each group yields a separate cycle overlaid on one plot. "
+            "The option stays visible and is disabled when the current "
+            "solver is not a limit-cycle solver.")
         self.multi_cycle_cb.setVisible(False)
-        layout.addWidget(self.multi_cycle_cb)
+        self.multi_cycle_cb.setEnabled(False)
+        self.guess_hint = QLabel()
+        self.guess_hint.setWordWrap(True)
+        self.guess_hint.setStyleSheet(f'color:{MUTED};font-size:9pt;')
+        layout.addWidget(self.guess_hint)
 
         self.init_group.setLayout(layout)
         return self.init_group
+
+    def _rebuild_initial_values(self, n):
+        previous = [(cb.isChecked(), sp.value()) for cb, sp in zip(self.ic_known, self.ic_value)]
+        while self.ic_grid.count():
+            widget = self.ic_grid.takeAt(0).widget()
+            widget.setParent(None)
+            widget.deleteLater()
+        self.ic_known, self.ic_value = [], []
+        for i in range(n):
+            cb = QCheckBox(f'x{i+1}(a)')
+            cb.setToolTip('Known initial component; other components use the guess field.')
+            sp = QDoubleSpinBox()
+            sp.setRange(-1e9, 1e9)
+            sp.setDecimals(8)
+            sp.setMinimumWidth(110)
+            if i < len(previous):
+                cb.setChecked(previous[i][0])
+                sp.setValue(previous[i][1])
+            sp.setEnabled(cb.isChecked())
+            cb.toggled.connect(sp.setEnabled)
+            self.ic_known.append(cb)
+            self.ic_value.append(sp)
+            self.ic_grid.addWidget(cb, i, 0)
+            self.ic_grid.addWidget(sp, i, 1)
 
     def _update_multi_cycle_visibility(self):
         """Show the multi-cycle checkbox only for limit‑cycle‑shaped problems."""
@@ -2136,19 +1970,26 @@ class MainWindow(QMainWindow):
             return
         if self.multi_cycle_cb is None:
             return
-        import re as _re
-        dim = len(self.equation_edits)
-        eqs = ' '.join([ed.text() for ed in self.equation_edits]).lower()
-        bc = self.bc_edit.toPlainText().lower()
-        is_lc = (
-            dim >= 4 and 'sin' in eqs and
-            _re.search(r'x2\(a\)\s*=\s*0', bc) and
-            _re.search(r'x2\(b\)\s*=\s*0', bc) and
-            _re.search(r'derivative\(x3', eqs)
-        ) or False
-        self.multi_cycle_cb.setVisible(is_lc)
-        if not is_lc:
-            self.multi_cycle_cb.setChecked(False)
+        try:
+            problem_type = detect_problem_type(self.get_dataset_from_ui())
+            if hasattr(self, 'sol_method_combo'):
+                index = self.sol_method_combo.currentIndex()
+                if 0 <= index < len(_SOLVER_CODES) and _SOLVER_CODES[index] != 'auto':
+                    problem_type = _SOLVER_CODES[index]
+            is_lc = problem_type == 'limit_cycle'
+        except (ValueError, AttributeError):
+            problem_type = 'custom'
+            is_lc = False
+        # Cycle multiplicity is inferred from the amplitude list.  Never let a
+        # hidden checkbox influence computation.
+        self.multi_cycle_cb.setChecked(False)
+        self.multi_cycle_cb.setEnabled(False)
+        self.multi_cycle_cb.setVisible(False)
+        is_lens = problem_type == 'lens'
+        self.x_start_spin.setEnabled(not is_lens)
+        self.x_end_spin.setEnabled(not is_lens)
+        if is_lens:
+            self.x_end_spin.setToolTip('Dimensionless interval [0,1]. Terminal time T is an unknown solved by the algorithm.')
 
     def create_solve_group(self):
         self.control_group = QGroupBox()
@@ -2220,6 +2061,16 @@ class MainWindow(QMainWindow):
             continuation_start = self.current_dataset.continuation_start
             continuation_end = self.current_dataset.continuation_end
             parameters = self.current_dataset.parameters
+        guess_text = self.guess_edit.text().strip()
+        initial_guess = None
+        if guess_text:
+            try:
+                initial_guess = [float(value.strip()) for value in guess_text.split(',')
+                                 if value.strip()]
+            except ValueError as exc:
+                raise ValueError('Initial guesses must be comma-separated numbers.') from exc
+            if not np.isfinite(initial_guess).all():
+                raise ValueError('Initial guesses must be finite.')
         return Dataset(
             name=self.name_edit.text(),
             x_start=self.x_start_spin.value(),
@@ -2234,9 +2085,11 @@ class MainWindow(QMainWindow):
             parameters=parameters,
             tol=self.eps_spin.value(),
             method=self.int_method_combo.currentText(),
+            initial_guess=initial_guess,
         )
 
     def set_dataset_to_ui(self, dataset):
+        self.current_dataset = dataset
         self.name_edit.setText(dataset.name)
         self.x_start_spin.setValue(dataset.x_start)
         self.x_end_spin.setValue(dataset.x_end)
@@ -2292,15 +2145,22 @@ class MainWindow(QMainWindow):
             # Каждая пара (vx, vy) — отдельная догадка пристрелки; обе орбиты
             # накладываются на один график (см. _solve_kepler).
             self.guess_edit.setText('-0.5, 0.5, 0.5, -0.5')
+        elif prob_type == 'lens':
+            self.guess_edit.setText('-0.5, -0.1, 4.0')
+            self.guess_edit.setToolTip('Initial guesses: psi1(0), psi2(0), T. T is solved, not fixed.')
         else:
             n_unknowns = max(0, len(dataset.equations) - len(a_side))
             if n_unknowns > 0:
-                defaults = ['0.5'] * max(2, n_unknowns)
+                defaults = ['0.5'] * n_unknowns
                 self.guess_edit.setText(', '.join(defaults))
-        # Visibility first (it un-checks for non-LC problems), then enable
-        # the multi-cycle overlay for the limit-cycle example.
+            else:
+                # Never retain guesses from the previously opened example.
+                # With every initial component fixed, stale values would be
+                # appended to the state vector and make its dimension invalid.
+                self.guess_edit.clear()
+        if dataset.initial_guess is not None:
+            self.guess_edit.setText(', '.join(f'{value:g}' for value in dataset.initial_guess))
         self._update_multi_cycle_visibility()
-        self.multi_cycle_cb.setChecked(is_lc)
         self._auto_fit_window()
 
     def clear_ui(self):
@@ -2422,11 +2282,17 @@ class MainWindow(QMainWindow):
                 return None
             text = param_edit.text().strip()
             try:
-                return [float(x.strip()) for x in text.split(',') if x.strip()]
-            except ValueError:
-                return [0.0, 0.5, 1.0]
+                values = [float(x.strip()) for x in text.split(',') if x.strip()]
+                if not values or not np.isfinite(values).all():
+                    raise ValueError('Provide at least one finite parameter value.')
+                return values
+            except ValueError as exc:
+                raise ValueError('Invalid continuation parameter list; no default values were substituted.') from exc
 
     def start_solve(self):
+        if self._solving:
+            return
+        self._clear_result()
         try:
             dataset = self.get_dataset_from_ui()
             self.current_dataset = dataset
@@ -2445,70 +2311,63 @@ class MainWindow(QMainWindow):
             try:
                 unknown_vals = ([float(x.strip()) for x in guess_text.split(',')
                                  if x.strip()] if guess_text else [])
-            except ValueError:
-                unknown_vals = []
+            except ValueError as exc:
+                raise ValueError('Initial guesses must be comma-separated numbers.') from exc
+            if not np.isfinite(unknown_vals).all():
+                raise ValueError('Initial guesses must be finite.')
+
+            multi_cycle_mode = False
+            n_components = len(self.ic_known)
+            unknown_indices = [i for i, cb in enumerate(self.ic_known)
+                               if not cb.isChecked()]
+
+            def build_state(values):
+                if len(values) != len(unknown_indices):
+                    raise ValueError(
+                        f'Expected exactly {len(unknown_indices)} initial guess '
+                        f'value(s), got {len(values)}.')
+                iterator = iter(values)
+                return [float(self.ic_value[i].value()) if self.ic_known[i].isChecked()
+                        else float(next(iterator)) for i in range(n_components)]
 
             if prob_type == 'limit_cycle':
                 # Для предельных циклов поле «Неизвестные» — это СПИСОК
                 # амплитуд x1, например «2, 6.5, 9» (пример 26.2 задаёт три
                 # точки p01, p02, p03).  Каждая амплитуда a порождает
                 # приближение [x1=a, x2=0, T=2π, x4=a]; решатель сходится к
-                # своему предельному циклу.  Флажок «Несколько циклов»
-                # накладывает ВСЕ амплитуды на один график; без него берётся
-                # только первая.
-                amps = unknown_vals if unknown_vals else [0.5]
-                if not self.multi_cycle_cb.isChecked():
-                    amps = amps[:1]
+                # своему предельному циклу.  One amplitude means one cycle;
+                # several amplitudes automatically request several cycles.
+                if not unknown_vals:
+                    raise ValueError('Enter at least one limit-cycle amplitude.')
+                amps = unknown_vals
                 two_pi = 2 * np.pi
                 combined = []
                 for a in amps:
                     combined.extend([float(a), 0.0, two_pi, float(a)])
                 initial_guess = combined
+                multi_cycle_mode = len(amps) > 1
+            elif prob_type == 'lens':
+                if len(unknown_vals) != 3:
+                    raise ValueError(
+                        'Lens requires exactly 3 guesses: psi1(0), psi2(0), T.')
+                initial_guess = list(unknown_vals)
+            elif prob_type == 'kepler':
+                count = len(unknown_indices)
+                if count == 0:
+                    if unknown_vals:
+                        raise ValueError('All initial components are fixed; remove extra guesses.')
+                    initial_guess = build_state([])
+                else:
+                    if not unknown_vals or len(unknown_vals) % count:
+                        raise ValueError(
+                            f'Kepler guesses must contain complete groups of {count} '
+                            f'value(s); got {len(unknown_vals)}.')
+                    combined = []
+                    for offset in range(0, len(unknown_vals), count):
+                        combined.extend(build_state(unknown_vals[offset:offset + count]))
+                    initial_guess = combined
             else:
-                # Generic builder: per component, use the spinbox value when
-                # the "known" checkbox is ticked, otherwise pull the next
-                # value from the comma-separated guess list.  Extra values
-                # form additional complete groups (multi-solution solves).
-                combined = []
-                u_idx = 0
-                for i in range(len(self.ic_known)):
-                    if self.ic_known[i].isChecked():
-                        combined.append(float(self.ic_value[i].value()))
-                    elif u_idx < len(unknown_vals):
-                        combined.append(unknown_vals[u_idx])
-                        u_idx += 1
-                    else:
-                        combined.append(0.0)
-
-                n_comp = len(self.ic_known)
-                n_known_per = sum(1 for cb in self.ic_known if cb.isChecked())
-                n_unk_per = n_comp - n_known_per
-                while n_unk_per > 0 and u_idx + n_unk_per <= len(unknown_vals):
-                    for i in range(n_comp):
-                        if self.ic_known[i].isChecked():
-                            combined.append(float(self.ic_value[i].value()))
-                        else:
-                            combined.append(unknown_vals[u_idx])
-                            u_idx += 1
-                while u_idx < len(unknown_vals):
-                    combined.append(unknown_vals[u_idx])
-                    u_idx += 1
-
-                initial_guess = combined if combined else None
-
-                # Предупреждение о недостатке приближений: несколько значений,
-                # но меньше числа неизвестных → раньше молча дополнялось нулями
-                # и график «разваливался».  Теперь спрашиваем подтверждение.
-                n_unknowns = sum(1 for cb in self.ic_known if not cb.isChecked())
-                if 0 < len(unknown_vals) < n_unknowns:
-                    reply = QMessageBox.question(
-                        self, self._tr('guess_warn_title'),
-                        self._tr('guess_warn_msg').format(
-                            n=len(unknown_vals), m=n_unknowns),
-                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                    if reply == QMessageBox.No:
-                        self._set_status(self._tr('cancelled'), 'cancelled')
-                        return
+                initial_guess = build_state(unknown_vals)
 
             mu_list = None
             if self._needs_mu_selection(dataset, explicit_type):
@@ -2518,6 +2377,8 @@ class MainWindow(QMainWindow):
                     return
 
             self.solve_btn.setEnabled(False)
+            self._pending_revision = self._input_revision
+            self._solving = True
             self._set_status(self._tr('computing'), 'computing')
 
             self._last_problem_type = prob_type
@@ -2532,21 +2393,28 @@ class MainWindow(QMainWindow):
             self.solver_thread = SolverThread(dataset, initial_guess,
                                               smooth_param_list=mu_list,
                                               explicit_type=explicit_type,
-                                              multi_cycle=self.multi_cycle_cb.isChecked())
-            self.solver_thread.finished.connect(self.on_solve_finished)
+                                              multi_cycle=multi_cycle_mode)
+            self.solver_thread.result_ready.connect(self.on_solve_finished)
             self.solver_thread.error.connect(self.on_solve_error)
             self.solver_thread.start()
         except Exception as e:
+            self._solving = False
             QMessageBox.critical(self, self._tr('error'),
                                  f"{self._tr('prep_error')} {str(e)}")
             self.solve_btn.setEnabled(True)
             self._set_status(self._tr('error'), 'error')
 
     def on_solve_finished(self, x_eval, y_eval):
+        self._solving = False
         self.solve_btn.setEnabled(True)
+        if self._pending_revision is not None and self._pending_revision != self._input_revision:
+            self._clear_result()
+            self._set_status(self._tr('changed'), 'changed')
+            return
         self._set_status(self._tr('done'), 'done')
         self._last_x = x_eval
         self._last_y = y_eval
+        self.graph_btn.setEnabled(True)
         self._last_name = self.current_dataset.name if self.current_dataset else ""
         self._last_guess_label = getattr(self, '_pending_guess_label', '')
         if self.current_dataset:
@@ -2565,6 +2433,8 @@ class MainWindow(QMainWindow):
         self._auto_show_plots()
 
     def on_solve_error(self, error_msg):
+        self._solving = False
+        self._clear_result()
         self.solve_btn.setEnabled(True)
         self._set_status(self._tr('error'), 'error')
         QMessageBox.critical(self, self._tr('solver_error'), error_msg)
@@ -2618,7 +2488,7 @@ class MainWindow(QMainWindow):
         elif pt == 'kepler':
             return ["x1", "x2", "x3", "x4"][:ny]
         elif pt == 'limit_cycle':
-            return ["x1", "x2", "T", "x3"][:ny]
+            return ["x1", "x2", "T", "x4"][:ny]
         return ["x" + str(i + 1) for i in range(ny)]
 
     def _add_history(self, name):
@@ -2701,6 +2571,8 @@ def plot_results_static(ax, x_eval, y_eval, name):
         for i, (x, y, label) in enumerate(x_eval):
             T = y[2, -1]
             ax.plot(y[0], y[1], color=colors[i % len(colors)], linewidth=2,
+                    ls=_curve_linestyle(layer_index=i,
+                                        layer_count=len(x_eval)),
                     label=f'{label}, T={T:.4f}')
             ax.plot(y[0, 0], y[1, 0], 'o', color=colors[i % len(colors)], markersize=8)
         ax.set_xlabel(r'$x_1$'); ax.set_ylabel(r'$x_2$')

@@ -4,9 +4,12 @@ __pycache__/
 *$py.class
 *.egg-info/
 .pytest_cache/
+.pytest_cache_*/
 .mypy_cache/
 build/
 dist/
+output/
+tmp/
 
 # Виртуальные окружения
 .venv/

@@ -71,8 +71,8 @@ def get_example_tasks() -> list:
                 "Derivative(x2(t), t) - x3 = 0",
                 "Derivative(x3(t), t) - 0.5*(sqrt(1e-10 + (x6 + 1)**2) - sqrt(1e-10 + (x6 - 1)**2)) = 0",
                 "Derivative(x4(t), t) = 0",
-                "Derivative(x5(t), t) - x4 = 0",
-                "Derivative(x6(t), t) - x5 = 0",
+                "Derivative(x5(t), t) + x4 = 0",
+                "Derivative(x6(t), t) + x5 = 0",
             ],
             boundary_conditions=[
                 "x1(a) = 1",
@@ -86,7 +86,7 @@ def get_example_tasks() -> list:
         ),
         Dataset(
             name="Example 26.4: Управление в форме лунки (Time-optimal, lens-shaped control)",
-            x_start=0.0, x_end=5.0,
+            x_start=0.0, x_end=1.0,
             equations=[
                 "Derivative(x1(t), t) - (x2 + u1) = 0",
                 "Derivative(x2(t), t) - (-1.5*x1 - 0.25*x2 + u2) = 0",
