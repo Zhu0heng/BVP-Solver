@@ -29,8 +29,8 @@ plt.style.use('seaborn-v0_8-darkgrid')
 plt.rcParams.update({'font.size': 14})
 
 from dataset import Dataset
-from solver import ContinuationSolver
-from task_io import save_task, load_task, get_example_tasks
+from solver import ContinuationSolver, BoundaryDiagnostics
+from task_io import save_task, load_task, get_example_tasks, get_van_der_pol_tasks
 from ui_theme import STYLESHEET, SURFACE, TEXT, MUTED, BORDER
 
 
@@ -189,6 +189,7 @@ class SolverThread(QThread):
         self.smooth_param_list = smooth_param_list
         self.explicit_type = explicit_type  # None / 'auto' → auto-detect; else use directly
         self.multi_cycle = multi_cycle
+        self.boundary_diagnostics = []
 
     def _solve_kepler(self):
         """Задача двух тел (Кеплер): краевая задача методом пристрелки.
@@ -267,6 +268,8 @@ class SolverThread(QThread):
             if sig in seen:
                 continue
             seen.append(sig)
+            self.boundary_diagnostics.append(BoundaryDiagnostics(
+                solver.last_diagnostics.residuals, f'v0=({ys[2, 0]:.6g}, {ys[3, 0]:.6g})'))
             try:
                 _, full_b = solver.full_orbit(ys[:, 0], n_points=500)
             except Exception:
@@ -325,6 +328,8 @@ class SolverThread(QThread):
                     x1_val = y_eval[0, 0]
                     T_val = y_eval[2, 0]
                     if abs(x1_val) > 1e-3 and abs(T_val) > 1e-3:
+                        self.boundary_diagnostics.append(BoundaryDiagnostics(
+                            solver.last_diagnostics.residuals, f'cycle {gi + 1}'))
                         all_solutions.append(
                             (x_eval, y_eval, None,
                              f'x1={x1_val:.2f} T={T_val:.2f}  '
@@ -561,6 +566,9 @@ class SolverThread(QThread):
         except Exception:
             y_out = y_eval
 
+        self.boundary_diagnostics.append(BoundaryDiagnostics(
+            solver._boundary_residual(y_eval[:, 0], y_eval[:, -1], param_val),
+            'triple integrator'))
         self.result_ready.emit(x_eval, y_out)
 
     def _solve_lens_control(self):
@@ -716,6 +724,10 @@ class SolverThread(QThread):
                              np.sum(y_dimless[2:4,-1]**2)-1]
             if not np.isfinite(y_dimless).all() or np.max(np.abs(residual)) > max(1e-6, 100*_tol):
                 raise RuntimeError(f'Lens trajectory failed endpoint validation at mu={mu:g}')
+            # Include fixed initial conditions as well as the three shooting
+            # conditions (terminal state and costate normalisation).
+            self.boundary_diagnostics.append(BoundaryDiagnostics(
+                np.r_[y_dimless[:2, 0] - [a1, a2], residual], f'mu={mu:g}'))
 
             u_vals = np.zeros((2, len(t_dimless)))
             for i in range(len(t_dimless)):
@@ -738,6 +750,7 @@ class SolverThread(QThread):
             self.result_ready.emit(layers, None)
 
     def run(self):
+        self.boundary_diagnostics = []
         try:
             if self.explicit_type and self.explicit_type != 'auto':
                 problem_type = self.explicit_type
@@ -771,6 +784,7 @@ class SolverThread(QThread):
                         chain = [v for v in dense if v <= pv + 1e-10]
                         xp, yp = solver.solve(self.initial_guess,
                                               lmbda_values=chain)
+                        self.boundary_diagnostics.append(solver.last_diagnostics)
                         layers.append((xp, yp, None, f'{param_name}={pv:.4g}'))
                     if layers:
                         self.result_ready.emit(layers, None)
@@ -778,8 +792,10 @@ class SolverThread(QThread):
                         raise RuntimeError("No parameter values converged")
                 else:
                     x_eval, y_eval = solver.solve(self.initial_guess)
+                    self.boundary_diagnostics.append(solver.last_diagnostics)
                     self.result_ready.emit(x_eval, y_eval)
         except Exception as e:
+            self.boundary_diagnostics = []
             self.error.emit(str(e))
 
     def _solve_parameter_values(self, problem_type):
@@ -800,6 +816,10 @@ class SolverThread(QThread):
             child.run()
             if 'error' in result:
                 raise RuntimeError(result['error'])
+            for diagnostic in child.boundary_diagnostics:
+                self.boundary_diagnostics.append(BoundaryDiagnostics(
+                    diagnostic.residuals,
+                    f'{self.dataset.continuation_param}={value:g} {diagnostic.label}'))
             entries = result['t'] if isinstance(result['t'],list) else [(result['t'],result['y'],None,'')]
             for entry in entries:
                 full = entry[2] if len(entry)==4 else None
@@ -1601,6 +1621,9 @@ class MainWindow(QMainWindow):
 
     def _clear_result(self):
         self._last_x = self._last_y = None
+        self._last_boundary_diagnostics = []
+        self.residual_label.setText('max boundary residual: —')
+        self.residual_label.setToolTip('')
         self.graph_btn.setEnabled(False)
         self._close_plot_windows()
 
@@ -2001,6 +2024,10 @@ class MainWindow(QMainWindow):
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setMinimumHeight(26)
         layout.addWidget(self.status_label)
+        self.residual_label = QLabel('max boundary residual: —')
+        self.residual_label.setWordWrap(True)
+        self.residual_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.residual_label)
 
         # Primary row: Solve (green, large) + Graph (blue)
         btn_row1 = QHBoxLayout()
@@ -2208,7 +2235,7 @@ class MainWindow(QMainWindow):
 
     def show_examples(self):
         try:
-            examples = get_example_tasks()
+            examples = get_example_tasks() + get_van_der_pol_tasks()
             items = [f"{i+1}. {ex.name}" for i, ex in enumerate(examples)]
             item, ok = QInputDialog.getItem(
                 self, self._tr('examples_title'), self._tr('examples_prompt'), items, 0, False
@@ -2414,6 +2441,14 @@ class MainWindow(QMainWindow):
         self._set_status(self._tr('done'), 'done')
         self._last_x = x_eval
         self._last_y = y_eval
+        worker = getattr(self, 'solver_thread', None)
+        self._last_boundary_diagnostics = list(getattr(worker, 'boundary_diagnostics', []))
+        if self._last_boundary_diagnostics:
+            maximum = max(d.max_boundary_residual for d in self._last_boundary_diagnostics)
+            self.residual_label.setText(f'max boundary residual: {maximum:.6e}')
+            self.residual_label.setToolTip('\n'.join(
+                f'{d.label}: {d.max_boundary_residual:.6e}; R={d.residuals}'
+                for d in self._last_boundary_diagnostics))
         self.graph_btn.setEnabled(True)
         self._last_name = self.current_dataset.name if self.current_dataset else ""
         self._last_guess_label = getattr(self, '_pending_guess_label', '')

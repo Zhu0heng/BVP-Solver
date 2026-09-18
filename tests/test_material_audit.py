@@ -50,6 +50,19 @@ def book_results():
         worker.run()
         assert 'error' not in result, result
         layers = result['t'] if isinstance(result['t'],list) else [(result['t'], result['y'])]
+        # Diagnostics must describe each accepted, displayed trajectory, including
+        # specialised solvers which do not finish through ContinuationSolver.solve.
+        assert len(worker.boundary_diagnostics) == len(layers)
+        for layer, diagnostic in zip(layers, worker.boundary_diagnostics):
+            y = layer[1]
+            if i == 3:
+                expected = np.r_[y[:2, 0] - [4, 1], y[:2, -1],
+                                 np.sum(y[2:4, -1]**2) - 1]
+            else:
+                expected = ContinuationSolver(ds)._boundary_residual(
+                    y[:, 0], y[:, -1], ds.continuation_end)
+            np.testing.assert_allclose(diagnostic.residuals, expected, atol=1e-14)
+            assert diagnostic.max_boundary_residual <= 1e-6
         results.append(layers)
     return results
 
@@ -318,6 +331,11 @@ def test_valid_kepler_user_guess_does_not_trigger_seed_scan(monkeypatch):
         calls.append(np.asarray(guess).copy())
         t=np.array([self.dataset.x_start,self.dataset.x_end])
         y=np.repeat(np.asarray(guess,dtype=float)[:,None],2,axis=1)
+        # This test double must provide the accepted-result metadata as well
+        # as the arrays; its purpose remains counting fallback seed attempts.
+        from solver import BoundaryDiagnostics
+        self.last_diagnostics = BoundaryDiagnostics(
+            self._boundary_residual(y[:, 0], y[:, -1], self.dataset.continuation_end))
         return t,y
     monkeypatch.setattr(ContinuationSolver,'solve',fake_solve)
     monkeypatch.setattr(ContinuationSolver,'full_orbit',

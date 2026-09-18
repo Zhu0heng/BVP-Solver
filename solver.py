@@ -8,9 +8,27 @@
 
 import numpy as np
 import re
+from dataclasses import dataclass
 from scipy.integrate import solve_ivp
 
 from parser import parse_equation_system, parse_boundary_conditions
+
+
+@dataclass(frozen=True)
+class BoundaryDiagnostics:
+    """Residuals of the accepted trajectory, in boundary-condition order."""
+    residuals: tuple
+    label: str = ''
+
+    def __post_init__(self):
+        values = tuple(float(value) for value in self.residuals)
+        if not values or not np.isfinite(values).all():
+            raise ValueError('Boundary residuals must be nonempty and finite.')
+        object.__setattr__(self, 'residuals', values)
+
+    @property
+    def max_boundary_residual(self):
+        return max(abs(value) for value in self.residuals)
 
 
 class ContinuationSolver:
@@ -25,6 +43,7 @@ class ContinuationSolver:
 
     def __init__(self, dataset):
         self.dataset = dataset
+        self.last_diagnostics = None
         # ε и метод интегрирования берутся из набора данных (управляются из GUI).
         # getattr — для совместимости со старыми JSON без этих полей.
         self.tol = getattr(dataset, 'tol', 1e-9)
@@ -304,6 +323,7 @@ class ContinuationSolver:
         solves at each lmbda value in sequence, using the previous
         solution as the initial guess for the next step.
         """
+        self.last_diagnostics = None
         if self.order == 1:
             need = self.n_dep
         else:
@@ -360,7 +380,17 @@ class ContinuationSolver:
                 raise RuntimeError(f'Boundary conditions not satisfied: max residual={np.max(np.abs(residual)):.3g}')
             final_lmbda = lmbda
 
-        return self._integrate_solution(last_p, final_lmbda)
+        x_eval, y_eval = self._integrate_solution(last_p, final_lmbda)
+        # Evaluate the exact endpoints of the trajectory that will be returned,
+        # not a previous Newton iterate or an independently reintegrated curve.
+        diagnostics = BoundaryDiagnostics(
+            self._boundary_residual(y_eval[:, 0], y_eval[:, -1], final_lmbda),
+            f'{self.dataset.continuation_param}={final_lmbda:g}',
+        )
+        if diagnostics.max_boundary_residual > max(1e-7, 100 * self.tol):
+            raise RuntimeError('Final trajectory does not satisfy the boundary conditions.')
+        self.last_diagnostics = diagnostics
+        return x_eval, y_eval
 
     def _integrate_solution(self, p, lmbda=0.0):
         """Integrate ODE from x_start to x_end with the given parameter value.

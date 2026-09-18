@@ -27,6 +27,20 @@ def load_task(filepath: str) -> Dataset:
     return Dataset.from_dict(data)
 
 
+def get_van_der_pol_tasks() -> list:
+    """Two initial-value experiments, represented by left-end conditions."""
+    return [Dataset(
+        name=f'Van der Pol: initial point ({x0:g}, {y0:g})',
+        x_start=0.0, x_end=60.0,
+        equations=[
+            'Derivative(x1(t), t) - x2 = 0',
+            'Derivative(x2(t), t) - ((1 - x1**2)*x2 - x1) = 0',
+        ],
+        boundary_conditions=[f'x1(a) = {x0:g}', f'x2(a) = {y0:g}'],
+        n_points=6001, method='DOP853', tol=1e-10,
+    ) for x0, y0 in [(0.1, 0.0), (4.0, 2.0)]]
+
+
 def get_example_tasks() -> list:
     return [
         Dataset(

@@ -1,0 +1,71 @@
+{
+  "experiment": "Van der Pol initial-value trajectories; not a periodic BVP",
+  "equations": [
+    "Derivative(x1(t), t) - x2 = 0",
+    "Derivative(x2(t), t) - ((1 - x1**2)*x2 - x1) = 0"
+  ],
+  "interval": [
+    0.0,
+    60.0
+  ],
+  "transient_end": 40.0,
+  "runs": [
+    {
+      "period_estimate": 6.663286859392215,
+      "consecutive_period_change": 3.0949109941502684e-10,
+      "section_y": 2.17271369467848,
+      "consecutive_section_change": 8.396914275010658e-10,
+      "last_cycle_endpoint_distance": 8.396914275016152e-10,
+      "last_three_upward_crossings": [
+        44.530610451274846,
+        51.19389731035757,
+        57.857184169749786
+      ],
+      "initial_point": [
+        0.1,
+        0.0
+      ],
+      "boundary_residuals": [
+        0.0,
+        0.0
+      ],
+      "max_boundary_residual": 0.0,
+      "boundary_conditions": [
+        "x1(a) = 0.1",
+        "x2(a) = 0"
+      ],
+      "method": "DOP853",
+      "tolerance": 1e-10
+    },
+    {
+      "period_estimate": 6.663286859509661,
+      "consecutive_period_change": 3.67329278105899e-10,
+      "section_y": 2.1727136935501217,
+      "consecutive_section_change": 2.2561197354775686e-09,
+      "last_cycle_endpoint_distance": 2.2561197354848792e-09,
+      "last_three_upward_crossings": [
+        44.49178081305666,
+        51.15506767219899,
+        57.81835453170865
+      ],
+      "initial_point": [
+        4.0,
+        2.0
+      ],
+      "boundary_residuals": [
+        0.0,
+        0.0
+      ],
+      "max_boundary_residual": 0.0,
+      "boundary_conditions": [
+        "x1(a) = 4",
+        "x2(a) = 2"
+      ],
+      "method": "DOP853",
+      "tolerance": 1e-10
+    }
+  ],
+  "phase_aligned_max_distance": 5.041740210250028e-09,
+  "numerical_convergence_passed": true,
+  "residual_note": "Boundary residuals here measure the prescribed initial conditions only."
+}

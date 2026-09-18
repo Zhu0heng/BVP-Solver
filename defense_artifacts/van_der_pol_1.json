@@ -1,0 +1,22 @@
+{
+    "name": "Van der Pol: initial point (0.1, 0)",
+    "x_start": 0.0,
+    "x_end": 60.0,
+    "equations": [
+        "Derivative(x1(t), t) - x2 = 0",
+        "Derivative(x2(t), t) - ((1 - x1**2)*x2 - x1) = 0"
+    ],
+    "boundary_conditions": [
+        "x1(a) = 0.1",
+        "x2(a) = 0"
+    ],
+    "parameters": null,
+    "n_points": 6001,
+    "continuation_param": "lambda",
+    "continuation_start": 0.0,
+    "continuation_end": 1.0,
+    "continuation_steps": 10,
+    "tol": 1e-10,
+    "method": "DOP853",
+    "initial_guess": null
+}
