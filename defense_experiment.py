@@ -1,6 +1,7 @@
 """Reproducible defense experiment using the project's actual solver pipeline."""
 from pathlib import Path
 import json
+import re
 
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -8,6 +9,38 @@ from scipy.optimize import brentq
 
 from solver import ContinuationSolver
 from task_io import get_van_der_pol_tasks, save_task
+
+
+def validate_experiment_inputs(datasets):
+    """Require two distinct IVPs of the same system, before any integration."""
+    if len(datasets) != 2:
+        raise ValueError('The defense experiment requires exactly two initial points.')
+    first, second = datasets
+    for field in ('equations', 'parameters', 'continuation_param',
+                  'continuation_end', 'x_start', 'x_end'):
+        if getattr(first, field) != getattr(second, field):
+            raise ValueError(f'Both experiments must use the same system and interval: {field}.')
+    points = []
+    for dataset in datasets:
+        if len(dataset.equations) != 2:
+            raise ValueError('The phase experiment requires two first-order state equations.')
+        values = {}
+        for condition in dataset.boundary_conditions:
+            match = re.fullmatch(r'\s*(x[12])\(a\)\s*=\s*(.+)\s*', condition)
+            if not match or match[1] in values:
+                raise ValueError('Provide each initial condition x1(a), x2(a) exactly once.')
+            try:
+                values[match[1]] = float(match[2])
+            except ValueError as exc:
+                raise ValueError('Initial conditions for the experiment must be numeric literals.') from exc
+        if set(values) != {'x1', 'x2'} or not np.isfinite(list(values.values())).all():
+            raise ValueError('Provide finite initial conditions for both x1 and x2.')
+        points.append(np.array([values['x1'], values['x2']]))
+    separation = np.linalg.norm(points[0] - points[1])
+    scale = max(1.0, *(np.linalg.norm(point) for point in points))
+    if separation <= 0.1 * scale:
+        raise ValueError('Choose two substantially different initial points (separation > 10% of scale).')
+    return points
 
 
 def analyse_tail(t, states, transient_end=40.0):
@@ -25,6 +58,8 @@ def analyse_tail(t, states, transient_end=40.0):
         raise RuntimeError('Need at least three upward crossings after the transient.')
     last_three = np.asarray(crossings[-3:])
     periods = np.diff(last_three)
+    if np.max(np.diff(t)) > np.min(periods) / 100:
+        raise RuntimeError('Output sampling is too coarse for cycle validation; increase n_points.')
     phase = np.linspace(0.0, 1.0, 1001)
     cycle = interpolant(last_three[-2] + phase * periods[-1])
     section_states = interpolant(last_three)
@@ -41,14 +76,14 @@ def analyse_tail(t, states, transient_end=40.0):
 def compute_experiment(datasets=None):
     """Solve both user datasets through ContinuationSolver, with no saved answers."""
     datasets = get_van_der_pol_tasks() if datasets is None else datasets
-    if len(datasets) != 2:
-        raise ValueError('The defense experiment requires exactly two initial points.')
+    initial_points = validate_experiment_inputs(datasets)
     trajectories, summaries, cycles = [], [], []
-    for dataset in datasets:
+    for dataset, initial in zip(datasets, initial_points):
         solver = ContinuationSolver(dataset)
         # An initial guess for the existing boundary solver. Actual initial
         # conditions remain defined by dataset.boundary_conditions.
-        initial = [float(condition.split('=', 1)[1]) for condition in dataset.boundary_conditions]
+        if solver.order != 1 or solver.dep_vars != ['x1', 'x2']:
+            raise ValueError('The phase experiment requires first-order states x1 and x2.')
         t, states = solver.solve(initial)
         summary, cycle = analyse_tail(t, states)
         diagnostic = solver.last_diagnostics
@@ -61,9 +96,10 @@ def compute_experiment(datasets=None):
         summaries.append(summary)
         cycles.append(cycle)
     distance = float(np.max(np.linalg.norm(cycles[0] - cycles[1], axis=0)))
+    period_difference = abs(summaries[0]['period_estimate'] - summaries[1]['period_estimate'])
     # This is a numerical convergence diagnostic, not an existence/uniqueness
     # proof or the boundary residual of a periodic boundary-value problem.
-    converged = (distance < 1e-3 and all(
+    converged = (distance < 1e-3 and period_difference < 1e-4 and all(
         row['consecutive_period_change'] < 1e-4 and
         row['consecutive_section_change'] < 1e-4 for row in summaries))
     report = {
@@ -73,6 +109,7 @@ def compute_experiment(datasets=None):
         'transient_end': 40.0,
         'runs': summaries,
         'phase_aligned_max_distance': distance,
+        'between_run_period_difference': period_difference,
         'numerical_convergence_passed': bool(converged),
         'residual_note': 'Boundary residuals here measure the prescribed initial conditions only.',
     }
@@ -106,7 +143,7 @@ def save_phase_portrait(trajectories, cycles, report, path):
         ax.set_aspect('equal', adjustable='datalim')
         ax.grid(alpha=0.2)
         ax.legend(fontsize=8, loc='best')
-    fig.suptitle("Van der Pol: x' = y, y' = (1 - x²)y - x", fontsize=15)
+    fig.suptitle('Two initial points: transient and late-cycle comparison', fontsize=15)
     fig.supxlabel('Long-time IVP integration; this figure is not a solved periodic BVP', fontsize=10)
     fig.savefig(path, dpi=180)
 

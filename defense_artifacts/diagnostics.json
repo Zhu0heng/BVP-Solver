@@ -66,6 +66,7 @@
     }
   ],
   "phase_aligned_max_distance": 5.041740210250028e-09,
+  "between_run_period_difference": 1.1744560879378696e-10,
   "numerical_convergence_passed": true,
   "residual_note": "Boundary residuals here measure the prescribed initial conditions only."
 }
