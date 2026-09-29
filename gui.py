@@ -10,11 +10,12 @@
 import sys
 import numpy as np
 import re
+from pathlib import Path
 from scipy.spatial import cKDTree
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QTextEdit, QPushButton, QGroupBox, QCheckBox,
-    QGridLayout, QSpinBox, QDoubleSpinBox, QFileDialog, QMessageBox,
+    QGridLayout, QSpinBox, QDoubleSpinBox, QFileDialog, QMessageBox, QDialogButtonBox,
     QInputDialog, QComboBox, QScrollArea, QMenu, QListWidget, QFrame
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -101,6 +102,16 @@ def _curves_visually_overlap(x, y, previous_curves):
 # Parallel to TR['sol_method_items'] — language-independent solver codes.
 # Index 0 = auto-detect (legacy behaviour), 1..5 = explicit choices.
 _SOLVER_CODES = ['auto', 'custom', 'kepler', 'limit_cycle', 'triple', 'lens']
+
+
+def _set_dialog_button_language(buttons, lang):
+    """Translate standard Qt dialog buttons regardless of the OS locale."""
+    ok = buttons.button(QDialogButtonBox.Ok)
+    cancel = buttons.button(QDialogButtonBox.Cancel)
+    if ok is not None:
+        ok.setText('ОК' if lang == 'ru' else 'OK')
+    if cancel is not None:
+        cancel.setText('Отмена' if lang == 'ru' else 'Cancel')
 
 
 class ScientificDoubleSpinBox(QDoubleSpinBox):
@@ -859,6 +870,7 @@ class PlotWindow(QMainWindow):
         self._layer_style_count = layer_style_count
         self._initial_x_name = initial_x_name
         self._initial_y_names = initial_y_names
+        self.lang = getattr(parent, 'lang', 'en')
 
         if isinstance(t_data, list):
             self._has_layers = True
@@ -895,7 +907,61 @@ class PlotWindow(QMainWindow):
             if selected:
                 self._y_indices = selected
                 self.btn_y.setText(", ".join(self._y_items[i] for i in selected))
+        self.apply_language()
+
+    def _tr(self, key):
+        return MainWindow.TR[self.lang][key]
+
+    def apply_language(self):
+        parent = self.parent()
+        self.lang = getattr(parent, 'lang', self.lang)
+        title = self.dataset_title
+        if isinstance(parent, MainWindow):
+            title = parent._display_example_name(title)
+        self.setWindowTitle(title)
+        self.btn_split.setText(self._tr('plot_split'))
+        self.btn_split.setToolTip(self._tr('plot_split_tip'))
+        self.btn_save.setText(self._tr('plot_save'))
+        self.btn_save.setToolTip(self._tr('plot_save_tip'))
         self._redraw()
+
+    def save_plot(self):
+        """Export the figure exactly as currently configured in this window."""
+        filters = {
+            'PNG (*.png)': '.png',
+            'SVG (*.svg)': '.svg',
+            'PDF (*.pdf)': '.pdf',
+        }
+        suggested = re.sub(r'[<>:"/\\|?*]+', '_', self.windowTitle()).strip(' ._')
+        suggested = (suggested or 'plot') + '.png'
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, self._tr('plot_save_title'), suggested, ';;'.join(filters))
+        if not path:
+            return
+        target = Path(path)
+        if not target.suffix:
+            target = target.with_suffix(filters.get(selected_filter, '.png'))
+        if target.suffix.lower() not in filters.values():
+            QMessageBox.warning(self, self._tr('plot_save_error'),
+                                self._tr('plot_format_error'))
+            return
+        try:
+            self.canvas.fig.savefig(target, dpi=180,
+                                    format=target.suffix.lower().lstrip('.'),
+                                    facecolor=self.canvas.fig.get_facecolor())
+        except Exception as exc:
+            parent = self.parent()
+            detail = (parent._localized_error(exc) if isinstance(parent, MainWindow)
+                      else str(exc))
+            QMessageBox.critical(self, self._tr('plot_save_error'), detail)
+
+    def _display_curve_label(self, label):
+        if self.lang == 'ru':
+            label = re.sub(r'\bguess\b', 'приближение', label)
+            label = re.sub(r'\bcycle\b', 'цикл', label)
+        else:
+            label = label.replace('Орбита', 'Orbit')
+        return label
 
     def _build_ui(self, t_data, y_data, varnames):
         central = QWidget()
@@ -921,12 +987,13 @@ class PlotWindow(QMainWindow):
         bar.addWidget(self.btn_y)
         bar.addStretch()
 
+        self.btn_save = QPushButton()
+        self.btn_save.setObjectName('plotToolBtn')
+        self.btn_save.clicked.connect(self.save_plot)
+        bar.addWidget(self.btn_save)
+
         # Split/Combine toggle — only meaningful when there ARE multiple layers
-        self.btn_split = QPushButton("Split solutions")
-        self.btn_split.setToolTip(
-            "Open each solution in its own window; "
-            "click again to recombine into one view."
-        )
+        self.btn_split = QPushButton()
         self.btn_split.setObjectName("plotToolBtn")
         self.btn_split.clicked.connect(self._toggle_split_view)
         bar.addWidget(self.btn_split)
@@ -1001,6 +1068,7 @@ class PlotWindow(QMainWindow):
         lst.setCurrentRow(self._x_idx)
         layout.addWidget(lst)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        _set_dialog_button_language(btns, self.lang)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
@@ -1022,6 +1090,7 @@ class PlotWindow(QMainWindow):
             checks.append(cb)
             layout.addWidget(cb)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        _set_dialog_button_language(btns, self.lang)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
@@ -1122,6 +1191,7 @@ class PlotWindow(QMainWindow):
                 y_dat = entry[1]
                 has_full = len(entry) >= 4 and entry[2] is not None
                 label = entry[-1] if isinstance(entry[-1], str) else f"#{li+1}"
+                label = self._display_curve_label(label)
 
                 # ── Time-axis rescaling for limit cycles ──
                 # The solver normalises time to [0,1]; the true time is t·T.
@@ -1194,7 +1264,7 @@ class PlotWindow(QMainWindow):
                 drawn_curves.append((np.asarray(xx), np.asarray(yy)))
 
         if is_phase and xi == 1 and any(self._y_row.get(yi, -1) == 1 for yi in self._y_indices):
-            origin_lbl = 'центр (0, 0)' if self.problem_type == 'kepler' else 'начало (0, 0)'
+            origin_lbl = self._tr('plot_center' if self.problem_type == 'kepler' else 'plot_origin')
             ax.plot(0, 0, 'o', color='#7AA2F7', markersize=6, label=origin_lbl)
             ax.annotate('(0, 0)', (0, 0), textcoords='offset points',
                         xytext=(6, 6), color='#7AA2F7', fontsize=9)
@@ -1307,6 +1377,53 @@ class MainWindow(QMainWindow):
             'multi_cycle_tip': ('Check to split the guess values into groups\n'
                                 '— each group yields a separate cycle\n'
                                 'overlaid on one plot.'),
+            'residual_label': 'max boundary residual: {value}',
+            'residual_layer': '{label}: {value}; residuals R={residuals}',
+            'history_tip': 'Previously solved tasks — click to reload',
+            'dim_tip': 'Number of first-order ODEs (variables)',
+            'start_tip': 'Start of integration interval',
+            'end_tip': 'End of integration interval (must be > a)',
+            'lens_interval_tip': 'Dimensionless interval [0,1]. Terminal time T is solved by the algorithm.',
+            'name_tip': 'Descriptive task name (shown in window title and history)',
+            'advanced_tip': 'Show or hide solver tolerance, integrator and continuation steps',
+            'eps_tip': 'ODE solver tolerance (default 1e-9)',
+            'integrator_tip': 'solve_ivp method: RK45 for non-stiff, BDF for stiff equations',
+            'steps_tip': 'Number of continuation substeps between large parameter jumps',
+            'points_tip': 'Number of output points along the solution',
+            'strategy_tip': 'Solver strategy: Auto detects the problem; Continuation uses generic shooting; the other choices use specialised solvers.',
+            'eq_label_tip': 'Right-hand side of d({name})/dt',
+            'eq_edit_tip': 'f(t, x1…x{count}): right-hand side of d({name})/dt',
+            'eq_example': 'e.g. x2',
+            'variables_tip': 'Comma-separated variable names used in plot legends',
+            'bc_tip': 'Boundary conditions xi(a)=value or xi(b)=value, one per line',
+            'guess_tip': 'Comma-separated guesses for unchecked unknowns in variable order. For limit cycles, enter starting amplitudes.',
+            'lens_guess_tip': 'Initial guesses: psi1(0), psi2(0), T. T is solved, not fixed.',
+            'known_tip': 'Known initial component; use the guess field for the others.',
+            'solve_tip': 'Solve the problem with the current equations and initial guess',
+            'graph_tip': 'Open the plot window',
+            'export_tip': 'Save the current task as a JSON file',
+            'clear_tip': 'Clear all fields',
+            'load_tip': 'Load a task from a JSON file',
+            'examples_tip': 'Load a built-in example',
+            'json_filter': 'JSON files (*.json)',
+            'plot_split': 'Split solutions',
+            'plot_split_tip': 'Open each solution in a separate window',
+            'plot_save': 'Save image',
+            'plot_save_tip': 'Save the current plot as PNG, SVG or PDF',
+            'plot_save_title': 'Save plot',
+            'plot_save_error': 'Could not save plot',
+            'plot_format_error': 'Choose PNG, SVG or PDF format.',
+            'plot_origin': 'origin (0, 0)',
+            'plot_center': 'center (0, 0)',
+            'error_generic': 'The operation failed. Check the task data. Technical details are in the console.',
+            'example_names': [
+                'Example 26.1: Two-body problem (Kepler orbit)',
+                'Example 26.2: Limit cycles (Eckweiler system)',
+                'Example 26.3: Triple integrator (energy functional)',
+                'Example 26.4: Управление в форме лунки (Time-optimal, lens-shaped control)',
+                'Van der Pol: initial point (0.1, 0)',
+                'Van der Pol: initial point (4, 2)',
+            ],
         },
         'ru': {
             'title': 'Метод продолжения по параметру',
@@ -1382,6 +1499,53 @@ class MainWindow(QMainWindow):
             'multi_cycle_tip': ('Включите, чтобы разбить значения на группы —\n'
                                 'каждая группа даёт отдельный цикл\n'
                                 'на одном графике.'),
+            'residual_label': 'Максимальная невязка граничных условий: {value}',
+            'residual_layer': '{label}: {value}; невязки R={residuals}',
+            'history_tip': 'Ранее решённые задачи — нажмите для загрузки',
+            'dim_tip': 'Число уравнений первого порядка (переменных)',
+            'start_tip': 'Начало интервала интегрирования',
+            'end_tip': 'Конец интервала интегрирования (должен быть больше a)',
+            'lens_interval_tip': 'Безразмерный интервал [0,1]. Конечное время T определяется решателем.',
+            'name_tip': 'Название задачи для заголовка окна и истории',
+            'advanced_tip': 'Показать или скрыть точность, метод интегрирования и шаги продолжения',
+            'eps_tip': 'Точность решения ОДУ (по умолчанию 1e-9)',
+            'integrator_tip': 'Метод solve_ivp: RK45 для нежёстких, BDF для жёстких уравнений',
+            'steps_tip': 'Число промежуточных шагов метода продолжения',
+            'points_tip': 'Число точек вывода решения',
+            'strategy_tip': 'Стратегия решения: Авто определяет тип задачи; Продолжение использует общий метод пристрелки; остальные варианты — специальные решатели.',
+            'eq_label_tip': 'Правая часть уравнения d({name})/dt',
+            'eq_edit_tip': 'f(t, x1…x{count}): правая часть уравнения d({name})/dt',
+            'eq_example': 'например, x2',
+            'variables_tip': 'Имена переменных через запятую для обозначений на графике',
+            'bc_tip': 'Граничные условия xi(a)=значение или xi(b)=значение, по одному в строке',
+            'guess_tip': 'Начальные приближения для неизвестных компонент через запятую, в порядке переменных. Для предельных циклов введите начальные амплитуды.',
+            'lens_guess_tip': 'Начальные приближения: psi1(0), psi2(0), T. Значение T подбирается решателем.',
+            'known_tip': 'Известная начальная компонента; для остальных используйте поле приближений.',
+            'solve_tip': 'Решить задачу с текущими уравнениями и начальным приближением',
+            'graph_tip': 'Открыть окно графика',
+            'export_tip': 'Сохранить задачу в файл JSON',
+            'clear_tip': 'Очистить все поля',
+            'load_tip': 'Загрузить задачу из файла JSON',
+            'examples_tip': 'Загрузить встроенный пример',
+            'json_filter': 'Файлы JSON (*.json)',
+            'plot_split': 'Разделить решения',
+            'plot_split_tip': 'Открыть каждое решение в отдельном окне',
+            'plot_save': 'Сохранить рисунок',
+            'plot_save_tip': 'Сохранить текущий график в формате PNG, SVG или PDF',
+            'plot_save_title': 'Сохранить график',
+            'plot_save_error': 'Не удалось сохранить график',
+            'plot_format_error': 'Выберите формат PNG, SVG или PDF.',
+            'plot_origin': 'начало координат (0, 0)',
+            'plot_center': 'центр (0, 0)',
+            'error_generic': 'Не удалось выполнить действие. Проверьте данные задачи. Технические подробности выведены в консоль.',
+            'example_names': [
+                'Пример 26.1: задача двух тел (орбита Кеплера)',
+                'Пример 26.2: предельные циклы (система Эквейлера)',
+                'Пример 26.3: тройной интегратор (функционал энергии)',
+                'Пример 26.4: задача оптимального управления с лункой',
+                'Ван дер Поль: начальная точка (0.1, 0)',
+                'Ван дер Поль: начальная точка (4, 2)',
+            ],
         },
     }
 
@@ -1417,6 +1581,88 @@ class MainWindow(QMainWindow):
     def _tr(self, key):
         return self.TR.get(self.lang, self.TR['ru']).get(key, key)
 
+    def _display_example_name(self, name):
+        for index, english in enumerate(self.TR['en']['example_names']):
+            russian = self.TR['ru']['example_names'][index]
+            for candidate in (english, russian):
+                if name == candidate or name.startswith(candidate + ' — '):
+                    return self._tr('example_names')[index] + name[len(candidate):]
+        return name
+
+    def _format_residual(self):
+        diagnostics = getattr(self, '_last_boundary_diagnostics', [])
+        maximum = (f'{max(d.max_boundary_residual for d in diagnostics):.6e}'
+                   if diagnostics else '—')
+        self.residual_label.setText(self._tr('residual_label').format(value=maximum))
+        self.residual_label.setToolTip('\n'.join(
+            self._tr('residual_layer').format(
+                label=self._display_diagnostic_label(d.label),
+                value=f'{d.max_boundary_residual:.6e}',
+                residuals=d.residuals) for d in diagnostics))
+
+    def _display_diagnostic_label(self, label):
+        if self.lang == 'ru':
+            return (label.replace('triple integrator', 'тройной интегратор')
+                    .replace('cycle ', 'цикл '))
+        return label
+
+    def _localized_error(self, error):
+        message = str(error)
+        if self.lang != 'ru' or not re.search(r'[A-Za-z]{3}', message):
+            return message
+        known = {
+            'Initial guesses must be comma-separated numbers.':
+                'Начальные приближения должны быть числами через запятую.',
+            'Initial guesses must be finite.':
+                'Начальные приближения должны быть конечными числами.',
+            'All initial components are fixed; remove extra guesses.':
+                'Все начальные компоненты заданы; удалите лишние приближения.',
+            'Enter at least one limit-cycle amplitude.':
+                'Введите хотя бы одну амплитуду предельного цикла.',
+            'No equations provided': 'Не заданы уравнения.',
+            'No valid boundary conditions provided': 'Не заданы корректные граничные условия.',
+            'boundary_conditions must not be empty': 'Не заданы граничные условия.',
+            'equations must not be empty': 'Не заданы уравнения.',
+            'Final trajectory does not satisfy the boundary conditions.':
+                'Полученная траектория не удовлетворяет граничным условиям.',
+        }
+        if message in known:
+            return known[message]
+        match = re.fullmatch(
+            r'Expected exactly (\d+) initial guess value\(s\), got (\d+)\.', message)
+        if match:
+            return f'Ожидалось {match[1]} начальных приближений, получено {match[2]}.'
+        match = re.fullmatch(r'Boundary conditions not satisfied: max residual=(.+)', message)
+        if match:
+            return f'Граничные условия не выполнены: максимальная невязка {match[1]}.'
+        print(f'GUI error detail: {message}', file=sys.stderr)
+        return self._tr('error_generic')
+
+    def _apply_tooltips(self):
+        widget_keys = (
+            (self.history_list, 'history_tip'), (self.dim_spin, 'dim_tip'),
+            (self.x_start_spin, 'start_tip'),
+            (self.x_end_spin, 'lens_interval_tip' if not self.x_end_spin.isEnabled() else 'end_tip'),
+            (self.name_edit, 'name_tip'), (self.adv_toggle, 'advanced_tip'),
+            (self.eps_spin, 'eps_tip'), (self.int_method_combo, 'integrator_tip'),
+            (self.cont_steps_spin, 'steps_tip'), (self.n_points_spin, 'points_tip'),
+            (self.sol_method_combo, 'strategy_tip'), (self.var_names_edit, 'variables_tip'),
+            (self.bc_edit, 'bc_tip'), (self.solve_btn, 'solve_tip'),
+            (self.graph_btn, 'graph_tip'), (self.export_btn, 'export_tip'),
+            (self.clear_btn, 'clear_tip'), (self.load_btn, 'load_tip'),
+            (self.example_btn, 'examples_tip'))
+        for widget, key in widget_keys:
+            widget.setToolTip(self._tr(key))
+        self.guess_edit.setToolTip(self._tr(getattr(self, '_guess_tip_key', 'guess_tip')))
+        for checkbox in self.ic_known:
+            checkbox.setToolTip(self._tr('known_tip'))
+        for index, (label, edit) in enumerate(zip(self.eq_labels, self.equation_edits)):
+            name = f'x{index + 1}'
+            label.setToolTip(self._tr('eq_label_tip').format(name=name))
+            edit.setToolTip(self._tr('eq_edit_tip').format(
+                name=name, count=len(self.equation_edits)))
+            edit.setPlaceholderText(self._tr('eq_example') if index == 0 else '')
+
     def closeEvent(self, event):
         import os
         path = os.path.join(os.path.dirname(__file__), 'history.json')
@@ -1425,6 +1671,21 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def apply_language(self):
+        current_name = self.name_edit.text()
+        translated_name = self._display_example_name(current_name)
+        if translated_name != current_name:
+            self.name_edit.blockSignals(True)
+            self.name_edit.setText(translated_name)
+            self.name_edit.blockSignals(False)
+        self._last_name = self._display_example_name(getattr(self, '_last_name', ''))
+        for index in range(self.history_list.count()):
+            item = self.history_list.item(index)
+            old_name = item.text()
+            new_name = self._display_example_name(old_name)
+            if new_name != old_name:
+                item.setText(new_name)
+                if old_name in self._history_datasets:
+                    self._history_datasets[new_name] = self._history_datasets.pop(old_name)
         self.setWindowTitle(self._tr('title'))
         self.header_title.setText(self._tr('title'))
         self.header_subtitle.setText('Краевые задачи · SymPy + SciPy' if self.lang == 'ru' else 'Boundary-value problems · SymPy + SciPy')
@@ -1463,8 +1724,6 @@ class MainWindow(QMainWindow):
         self.sol_method_combo.addItems(self._tr('sol_method_items'))
         self.sol_method_combo.setCurrentIndex(method_index)
         self.sol_method_combo.blockSignals(False)
-        for i, ed in enumerate(self.equation_edits):
-            ed.setPlaceholderText(self._tr('eq_placeholder'))
         state = getattr(self, '_status_state', 'ready')
         self._set_status(self._tr(state), state)
         self.history_group.setTitle(self._tr('history'))
@@ -1472,9 +1731,13 @@ class MainWindow(QMainWindow):
         self.btn_about.setText(self._tr('about'))
         self.multi_cycle_cb.setText(self._tr('multi_cycle'))
         self.multi_cycle_cb.setToolTip(self._tr('multi_cycle_tip'))
+        self._format_residual()
+        self._apply_tooltips()
         self.about_menu.clear()
         self.about_menu.addAction(self._tr('instructions'), self._on_show_instructions)
         self.about_menu.addAction(self._tr('about_author'), self._on_show_author)
+        for plot_window in self.findChildren(PlotWindow):
+            plot_window.apply_language()
 
     def _on_lang_selected(self, lang_code):
         self.lang = lang_code
@@ -1504,6 +1767,7 @@ class MainWindow(QMainWindow):
             lbl_img.setAlignment(Qt.AlignCenter)
             layout.addWidget(lbl_img)
         btns = QDialogButtonBox(QDialogButtonBox.Ok)
+        _set_dialog_button_language(btns, self.lang)
         btns.accepted.connect(dlg.accept)
         layout.addWidget(btns)
         dlg.exec_()
@@ -1622,8 +1886,7 @@ class MainWindow(QMainWindow):
     def _clear_result(self):
         self._last_x = self._last_y = None
         self._last_boundary_diagnostics = []
-        self.residual_label.setText('max boundary residual: —')
-        self.residual_label.setToolTip('')
+        self._format_residual()
         self.graph_btn.setEnabled(False)
         self._close_plot_windows()
 
@@ -1686,7 +1949,7 @@ class MainWindow(QMainWindow):
         self.history_list = QListWidget()
         self.history_list.itemClicked.connect(self._on_history_clicked)
         self.history_list.setAlternatingRowColors(True)
-        self.history_list.setToolTip("Previously solved tasks — click to reload")
+        self.history_list.setToolTip(self._tr('history_tip'))
         layout.addWidget(self.history_list)
         self.history_group.setLayout(layout)
         self.history_list.setMaximumHeight(100)
@@ -1707,7 +1970,7 @@ class MainWindow(QMainWindow):
         self.dim_spin.setRange(1, 20)
         self.dim_spin.setValue(4)
         self.dim_spin.setFixedWidth(55)
-        self.dim_spin.setToolTip("Number of first‑order ODEs (variables)")
+        self.dim_spin.setToolTip(self._tr('dim_tip'))
         row1.addWidget(self.dim_spin)
         row1.addSpacing(8)
         self.lbl_a = QLabel()
@@ -1717,7 +1980,7 @@ class MainWindow(QMainWindow):
         self.x_start_spin.setValue(0.0)
         self.x_start_spin.setDecimals(12)
         self.x_start_spin.setFixedWidth(75)
-        self.x_start_spin.setToolTip("Start of integration interval")
+        self.x_start_spin.setToolTip(self._tr('start_tip'))
         row1.addWidget(self.x_start_spin)
         self.lbl_b = QLabel()
         row1.addWidget(self.lbl_b)
@@ -1726,7 +1989,7 @@ class MainWindow(QMainWindow):
         self.x_end_spin.setValue(7.0)
         self.x_end_spin.setDecimals(12)
         self.x_end_spin.setFixedWidth(75)
-        self.x_end_spin.setToolTip("End of integration interval (must be > a)")
+        self.x_end_spin.setToolTip(self._tr('end_tip'))
         row1.addWidget(self.x_end_spin)
         row1.addStretch()
         layout.addLayout(row1)
@@ -1736,16 +1999,16 @@ class MainWindow(QMainWindow):
         self.lbl_name = QLabel()
         row_name.addWidget(self.lbl_name)
         self.name_edit = QLineEdit("Моя задача")
-        self.name_edit.setToolTip("Descriptive task name (shown in window title & history)")
+        self.name_edit.setToolTip(self._tr('name_tip'))
         row_name.addWidget(self.name_edit)
         layout.addLayout(row_name)
 
         # ── Advanced settings (collapsible) ──
-        self.adv_toggle = QPushButton("▼ Advanced")
+        self.adv_toggle = QPushButton()
         self.adv_toggle.setCheckable(True)
         self.adv_toggle.setChecked(False)
         self.adv_toggle.setObjectName("secondaryBtn")
-        self.adv_toggle.setToolTip("Show/hide solver tolerance, integrator & continuation steps")
+        self.adv_toggle.setToolTip(self._tr('advanced_tip'))
         self.adv_toggle.toggled.connect(self._on_advanced_toggled)
         layout.addWidget(self.adv_toggle)
 
@@ -1762,7 +2025,7 @@ class MainWindow(QMainWindow):
         self.eps_spin.setDecimals(14)
         self.eps_spin.setValue(1e-9)
         self.eps_spin.setFixedWidth(105)
-        self.eps_spin.setToolTip("ODE solver tolerance (default 1e‑9)")
+        self.eps_spin.setToolTip(self._tr('eps_tip'))
         row2.addWidget(self.eps_spin)
         row2.addSpacing(8)
         self.lbl_integr = QLabel()
@@ -1771,7 +2034,7 @@ class MainWindow(QMainWindow):
         self.int_method_combo.addItems(
             ["RK45", "RK23", "DOP853", "Radau", "BDF", "LSODA"])
         self.int_method_combo.setFixedWidth(80)
-        self.int_method_combo.setToolTip("scipy.integrate.solve_ivp method — RK45 for non‑stiff, BDF for stiff")
+        self.int_method_combo.setToolTip(self._tr('integrator_tip'))
         row2.addWidget(self.int_method_combo)
         row2.addStretch()
         adv_layout.addLayout(row2)
@@ -1783,7 +2046,7 @@ class MainWindow(QMainWindow):
         self.cont_steps_spin.setRange(1, 200)
         self.cont_steps_spin.setValue(50)
         self.cont_steps_spin.setFixedWidth(55)
-        self.cont_steps_spin.setToolTip("Number of continuation sub‑steps between large parameter jumps")
+        self.cont_steps_spin.setToolTip(self._tr('steps_tip'))
         row3.addWidget(self.cont_steps_spin)
         self.lbl_points = QLabel()
         row3.addWidget(self.lbl_points)
@@ -1791,18 +2054,14 @@ class MainWindow(QMainWindow):
         self.n_points_spin.setRange(10, 10000)
         self.n_points_spin.setValue(500)
         self.n_points_spin.setFixedWidth(75)
-        self.n_points_spin.setToolTip("Number of output points along the solution")
+        self.n_points_spin.setToolTip(self._tr('points_tip'))
         row3.addWidget(self.n_points_spin)
         self.lbl_method = QLabel()
         row3.addWidget(self.lbl_method)
         self.sol_method_combo = QComboBox()
         self.sol_method_combo.addItems(["Продолжение"])
         self.sol_method_combo.setMinimumWidth(90)
-        self.sol_method_combo.setToolTip(
-            "Solver strategy:\n"
-            "• Auto — detect from equations/BCs\n"
-            "• Continuation — generic shooting\n"
-            "• Kepler / Limit cycles / Triple / Lens — specialised solvers")
+        self.sol_method_combo.setToolTip(self._tr('strategy_tip'))
         self.sol_method_combo.currentIndexChanged.connect(
             self._update_multi_cycle_visibility)
         row3.addWidget(self.sol_method_combo)
@@ -1838,13 +2097,13 @@ class MainWindow(QMainWindow):
             lbl = QLabel(f"{name} ' =")
             lbl.setMinimumWidth(36)
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            lbl.setToolTip(f"Right-hand side of d({name})/dt")
+            lbl.setToolTip(self._tr('eq_label_tip').format(name=name))
             self.eq_labels.append(lbl)
             self.eq_grid.addWidget(lbl, i, 0)
 
             edit = QLineEdit()
-            edit.setToolTip(f"f(t, x1…x{n}) — RHS for d({name})/dt")
-            edit.setPlaceholderText("e.g. x2" if i == 0 else "")
+            edit.setToolTip(self._tr('eq_edit_tip').format(name=name, count=n))
+            edit.setPlaceholderText(self._tr('eq_example') if i == 0 else '')
             self.equation_edits.append(edit)
             self.eq_grid.addWidget(edit, i, 1)
         self._set_eq_defaults()
@@ -1854,7 +2113,7 @@ class MainWindow(QMainWindow):
         self.lbl_variables = QLabel()
         row_vn.addWidget(self.lbl_variables)
         self.var_names_edit = QLineEdit("x1, x2, x3, x4")
-        self.var_names_edit.setToolTip("Comma‑separated variable names (used in plot legends)")
+        self.var_names_edit.setToolTip(self._tr('variables_tip'))
         row_vn.addWidget(self.var_names_edit)
         layout.addLayout(row_vn)
 
@@ -1863,7 +2122,7 @@ class MainWindow(QMainWindow):
         self.bc_edit = QTextEdit()
         self.bc_edit.setPlaceholderText("x1(a) = 2\nx2(a) = 0\nx1(b) = 1.07\nx2(b) = -1.10")
         self.bc_edit.setMinimumHeight(130)
-        self.bc_edit.setToolTip("Boundary conditions in the form  xi(a)=val  or  xi(b)=val, one per line")
+        self.bc_edit.setToolTip(self._tr('bc_tip'))
         layout.addWidget(self.bc_edit)
 
         self.dim_spin.valueChanged.connect(self._on_dim_changed)
@@ -1896,13 +2155,13 @@ class MainWindow(QMainWindow):
             lbl = QLabel(f"{name} ' =")
             lbl.setMinimumWidth(36)
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            lbl.setToolTip(f"Right-hand side of d({name})/dt")
+            lbl.setToolTip(self._tr('eq_label_tip').format(name=name))
             self.eq_labels.append(lbl)
             self.eq_grid.addWidget(lbl, i, 0)
 
             edit = QLineEdit()
-            edit.setToolTip(f"f(t, x1…x{new_dim}) — RHS for d({name})/dt")
-            edit.setPlaceholderText("e.g. x2" if i == 0 else "")
+            edit.setToolTip(self._tr('eq_edit_tip').format(name=name, count=new_dim))
+            edit.setPlaceholderText(self._tr('eq_example') if i == 0 else '')
             self.equation_edits.append(edit)
             self.eq_grid.addWidget(edit, i, 1)
 
@@ -1917,6 +2176,7 @@ class MainWindow(QMainWindow):
             self._rebuild_initial_values(new_dim)
             self._connect_input_changes()
             self._on_input_changed()
+            self._apply_tooltips()
         self._update_multi_cycle_visibility()
         self._auto_fit_window()
 
@@ -1936,23 +2196,15 @@ class MainWindow(QMainWindow):
         self.lbl_unknowns = QLabel()
         guess_row.addWidget(self.lbl_unknowns)
         self.guess_edit = QLineEdit("-0.5, 0.5")
-        self.guess_edit.setToolTip(
-            "Comma‑separated guesses for UNCHECKED unknowns:\n"
-            "one value per unknown, in x1, x2, … order.\n"
-            "Limit‑cycle problems: enter x1 amplitudes, e.g. 2, 6.5, 9 —\n"
-            "with 'Multiple cycles' checked each amplitude yields one cycle.")
+        self.guess_edit.setToolTip(self._tr('guess_tip'))
         guess_row.addWidget(self.guess_edit)
         layout.addLayout(guess_row)
 
         # Kept as an internal compatibility object for old code/tests, but it
         # is deliberately not added to the layout.  The number of requested
         # cycles is derived from the amplitude list, never from hidden state.
-        self.multi_cycle_cb = QCheckBox("Multiple cycles", self.init_group)
-        self.multi_cycle_cb.setToolTip(
-            "Check to split the guess values into groups of unknowns "
-            "→ each group yields a separate cycle overlaid on one plot. "
-            "The option stays visible and is disabled when the current "
-            "solver is not a limit-cycle solver.")
+        self.multi_cycle_cb = QCheckBox(self._tr('multi_cycle'), self.init_group)
+        self.multi_cycle_cb.setToolTip(self._tr('multi_cycle_tip'))
         self.multi_cycle_cb.setVisible(False)
         self.multi_cycle_cb.setEnabled(False)
         self.guess_hint = QLabel()
@@ -1972,7 +2224,7 @@ class MainWindow(QMainWindow):
         self.ic_known, self.ic_value = [], []
         for i in range(n):
             cb = QCheckBox(f'x{i+1}(a)')
-            cb.setToolTip('Known initial component; other components use the guess field.')
+            cb.setToolTip(self._tr('known_tip'))
             sp = QDoubleSpinBox()
             sp.setRange(-1e9, 1e9)
             sp.setDecimals(8)
@@ -2003,6 +2255,8 @@ class MainWindow(QMainWindow):
         except (ValueError, AttributeError):
             problem_type = 'custom'
             is_lc = False
+        self._guess_tip_key = 'lens_guess_tip' if problem_type == 'lens' else 'guess_tip'
+        self.guess_edit.setToolTip(self._tr(self._guess_tip_key))
         # Cycle multiplicity is inferred from the amplitude list.  Never let a
         # hidden checkbox influence computation.
         self.multi_cycle_cb.setChecked(False)
@@ -2012,7 +2266,9 @@ class MainWindow(QMainWindow):
         self.x_start_spin.setEnabled(not is_lens)
         self.x_end_spin.setEnabled(not is_lens)
         if is_lens:
-            self.x_end_spin.setToolTip('Dimensionless interval [0,1]. Terminal time T is an unknown solved by the algorithm.')
+            self.x_end_spin.setToolTip(self._tr('lens_interval_tip'))
+        else:
+            self.x_end_spin.setToolTip(self._tr('end_tip'))
 
     def create_solve_group(self):
         self.control_group = QGroupBox()
@@ -2024,7 +2280,7 @@ class MainWindow(QMainWindow):
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setMinimumHeight(26)
         layout.addWidget(self.status_label)
-        self.residual_label = QLabel('max boundary residual: —')
+        self.residual_label = QLabel()
         self.residual_label.setWordWrap(True)
         self.residual_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.residual_label)
@@ -2036,13 +2292,13 @@ class MainWindow(QMainWindow):
         self.solve_btn.setObjectName("solveBtn")
         self.solve_btn.clicked.connect(self.start_solve)
         self.solve_btn.setMinimumHeight(36)
-        self.solve_btn.setToolTip("Run the BVP solver with the current equations and initial guess")
+        self.solve_btn.setToolTip(self._tr('solve_tip'))
         btn_row1.addWidget(self.solve_btn, 2)
 
         self.graph_btn = QPushButton()
         self.graph_btn.clicked.connect(self.show_plot_window)
         self.graph_btn.setMinimumHeight(36)
-        self.graph_btn.setToolTip("Open plot window (or re‑open the last one)")
+        self.graph_btn.setToolTip(self._tr('graph_tip'))
         btn_row1.addWidget(self.graph_btn, 1)
         layout.addLayout(btn_row1)
 
@@ -2050,10 +2306,10 @@ class MainWindow(QMainWindow):
         btn_row2 = QHBoxLayout()
         btn_row2.setSpacing(5)
         _tips = {
-            'export_btn': "Save current task as JSON file",
-            'clear_btn': "Clear all fields and reset to defaults",
-            'load_btn': "Load a task from a JSON file",
-            'example_btn': "Load a built-in example",
+            'export_btn': 'export_tip',
+            'clear_btn': 'clear_tip',
+            'load_btn': 'load_tip',
+            'example_btn': 'examples_tip',
         }
         for attr, slot in [
             ('export_btn', self.save_task),
@@ -2065,7 +2321,7 @@ class MainWindow(QMainWindow):
             btn.setObjectName("secondaryBtn")
             btn.clicked.connect(slot)
             btn.setMinimumHeight(26)
-            btn.setToolTip(_tips.get(attr, ''))
+            btn.setToolTip(self._tr(_tips[attr]))
             setattr(self, attr, btn)
             btn_row2.addWidget(btn)
         layout.addLayout(btn_row2)
@@ -2117,7 +2373,7 @@ class MainWindow(QMainWindow):
 
     def set_dataset_to_ui(self, dataset):
         self.current_dataset = dataset
-        self.name_edit.setText(dataset.name)
+        self.name_edit.setText(self._display_example_name(dataset.name))
         self.x_start_spin.setValue(dataset.x_start)
         self.x_end_spin.setValue(dataset.x_end)
         self.n_points_spin.setValue(dataset.n_points)
@@ -2174,7 +2430,6 @@ class MainWindow(QMainWindow):
             self.guess_edit.setText('-0.5, 0.5, 0.5, -0.5')
         elif prob_type == 'lens':
             self.guess_edit.setText('-0.5, -0.1, 4.0')
-            self.guess_edit.setToolTip('Initial guesses: psi1(0), psi2(0), T. T is solved, not fixed.')
         else:
             n_unknowns = max(0, len(dataset.equations) - len(a_side))
             if n_unknowns > 0:
@@ -2187,6 +2442,8 @@ class MainWindow(QMainWindow):
                 self.guess_edit.clear()
         if dataset.initial_guess is not None:
             self.guess_edit.setText(', '.join(f'{value:g}' for value in dataset.initial_guess))
+        self._guess_tip_key = 'lens_guess_tip' if prob_type == 'lens' else 'guess_tip'
+        self.guess_edit.setToolTip(self._tr(self._guess_tip_key))
         self._update_multi_cycle_visibility()
         self._auto_fit_window()
 
@@ -2207,22 +2464,22 @@ class MainWindow(QMainWindow):
         if os.path.isdir(examples_path):
             start_dir = examples_path
         filepath, _ = QFileDialog.getOpenFileName(
-            self, self._tr('load_dialog_title'), start_dir, "JSON Files (*.json)"
+            self, self._tr('load_dialog_title'), start_dir, self._tr('json_filter')
         )
         if filepath:
             try:
                 dataset = load_task(filepath)
                 self.set_dataset_to_ui(dataset)
                 self.current_dataset = dataset
-                self.setWindowTitle(dataset.name + ' — ' + self._tr('title'))
+                self.setWindowTitle(self._display_example_name(dataset.name) + ' — ' + self._tr('title'))
                 QMessageBox.information(self, self._tr('load_success'), self._tr('load_msg'))
             except Exception as e:
                 QMessageBox.critical(self, self._tr('load_error'),
-                                     f"{self._tr('load_error_msg')} {str(e)}")
+                                     f"{self._tr('load_error_msg')} {self._localized_error(e)}")
 
     def save_task(self):
         filepath, _ = QFileDialog.getSaveFileName(
-            self, self._tr('save_dialog_title'), "", "JSON Files (*.json)"
+            self, self._tr('save_dialog_title'), "", self._tr('json_filter')
         )
         if filepath:
             try:
@@ -2231,15 +2488,22 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, self._tr('save_success'), self._tr('save_msg'))
             except Exception as e:
                 QMessageBox.critical(self, self._tr('save_error'),
-                                     f"{self._tr('save_error_msg')} {str(e)}")
+                                     f"{self._tr('save_error_msg')} {self._localized_error(e)}")
 
     def show_examples(self):
         try:
             examples = get_example_tasks() + get_van_der_pol_tasks()
-            items = [f"{i+1}. {ex.name}" for i, ex in enumerate(examples)]
-            item, ok = QInputDialog.getItem(
-                self, self._tr('examples_title'), self._tr('examples_prompt'), items, 0, False
-            )
+            items = [f"{i+1}. {self._display_example_name(ex.name)}"
+                     for i, ex in enumerate(examples)]
+            dialog = QInputDialog(self)
+            dialog.setWindowTitle(self._tr('examples_title'))
+            dialog.setLabelText(self._tr('examples_prompt'))
+            dialog.setComboBoxItems(items)
+            dialog.setComboBoxEditable(False)
+            dialog.setOkButtonText('ОК' if self.lang == 'ru' else 'OK')
+            dialog.setCancelButtonText('Отмена' if self.lang == 'ru' else 'Cancel')
+            ok = bool(dialog.exec_())
+            item = dialog.textValue()
             if ok and item:
                 idx = items.index(item)
                 self.set_dataset_to_ui(examples[idx])
@@ -2250,7 +2514,7 @@ class MainWindow(QMainWindow):
                 self.sol_method_combo.setCurrentIndex(0)
         except Exception as e:
             QMessageBox.critical(self, self._tr('examples_title'),
-                                 f"{self._tr('load_error_msg')} {str(e)}")
+                                 f"{self._tr('load_error_msg')} {self._localized_error(e)}")
 
     def _needs_mu_selection(self, dataset, explicit_type=None):
         effective = (explicit_type if (explicit_type and explicit_type != 'auto')
@@ -2285,6 +2549,7 @@ class MainWindow(QMainWindow):
                 checks[label] = cb
                 layout.addWidget(cb)
             btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            _set_dialog_button_language(btns, self.lang)
             btns.accepted.connect(dlg.accept)
             btns.rejected.connect(dlg.reject)
             layout.addWidget(btns)
@@ -2302,6 +2567,7 @@ class MainWindow(QMainWindow):
             param_edit = QLineEdit("0.0, 0.25, 0.5, 0.75, 1.0")
             layout.addWidget(param_edit)
             btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            _set_dialog_button_language(btns, self.lang)
             btns.accepted.connect(dlg.accept)
             btns.rejected.connect(dlg.reject)
             layout.addWidget(btns)
@@ -2427,7 +2693,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._solving = False
             QMessageBox.critical(self, self._tr('error'),
-                                 f"{self._tr('prep_error')} {str(e)}")
+                                 f"{self._tr('prep_error')} {self._localized_error(e)}")
             self.solve_btn.setEnabled(True)
             self._set_status(self._tr('error'), 'error')
 
@@ -2443,17 +2709,12 @@ class MainWindow(QMainWindow):
         self._last_y = y_eval
         worker = getattr(self, 'solver_thread', None)
         self._last_boundary_diagnostics = list(getattr(worker, 'boundary_diagnostics', []))
-        if self._last_boundary_diagnostics:
-            maximum = max(d.max_boundary_residual for d in self._last_boundary_diagnostics)
-            self.residual_label.setText(f'max boundary residual: {maximum:.6e}')
-            self.residual_label.setToolTip('\n'.join(
-                f'{d.label}: {d.max_boundary_residual:.6e}; R={d.residuals}'
-                for d in self._last_boundary_diagnostics))
+        self._format_residual()
         self.graph_btn.setEnabled(True)
-        self._last_name = self.current_dataset.name if self.current_dataset else ""
+        self._last_name = self._display_example_name(self.current_dataset.name) if self.current_dataset else ""
         self._last_guess_label = getattr(self, '_pending_guess_label', '')
         if self.current_dataset:
-            name = self.current_dataset.name
+            name = self._display_example_name(self.current_dataset.name)
             self._add_history(name)
             self._history_datasets[name] = self.current_dataset
             try:
@@ -2472,7 +2733,7 @@ class MainWindow(QMainWindow):
         self._clear_result()
         self.solve_btn.setEnabled(True)
         self._set_status(self._tr('error'), 'error')
-        QMessageBox.critical(self, self._tr('solver_error'), error_msg)
+        QMessageBox.critical(self, self._tr('solver_error'), self._localized_error(error_msg))
 
     def show_plot_window(self):
         if self._last_x is None:

@@ -112,7 +112,7 @@ class TestSetDatasetToUI:
         win.set_dataset_to_ui(get_example_tasks()[0])   # Kepler
         assert win.multi_cycle_cb.isHidden() is True
         assert win.multi_cycle_cb.isChecked() is False
-        assert win.name_edit.text() == get_example_tasks()[0].name
+        assert win.name_edit.text() == 'Пример 26.1: задача двух тел (орбита Кеплера)'
 
 
 class TestGetVarnames:

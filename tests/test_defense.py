@@ -72,12 +72,108 @@ def test_gui_displays_actual_residual_and_invalidates_it(monkeypatch):
         assert window._status_state == 'done'
         assert window._last_boundary_diagnostics
         maximum = max(d.max_boundary_residual for d in window._last_boundary_diagnostics)
+        assert window.residual_label.text() == f'Максимальная невязка граничных условий: {maximum:.6e}'
+        assert window.residual_label.toolTip().startswith('lambda=')
+        assert 'невязки R=' in window.residual_label.toolTip()
+        assert window.name_edit.text() == 'Ван дер Поль: начальная точка (0.1, 0)'
+        window._on_lang_selected('en')
         assert window.residual_label.text() == f'max boundary residual: {maximum:.6e}'
+        assert 'residuals R=' in window.residual_label.toolTip()
+        assert window.name_edit.text() == 'Van der Pol: initial point (0.1, 0)'
+        window._on_lang_selected('ru')
+        assert window.residual_label.text() == f'Максимальная невязка граничных условий: {maximum:.6e}'
+        assert window.graph_btn.isEnabled()
         window.equation_edits[1].setText('-x1')
         assert window._last_boundary_diagnostics == []
-        assert window.residual_label.text() == 'max boundary residual: —'
+        assert window.residual_label.text() == 'Максимальная невязка граничных условий: —'
         assert not window.graph_btn.isEnabled()
     finally:
+        window.close()
+        app.processEvents()
+
+
+def test_russian_ui_tooltips_examples_and_plot_switch_with_language(monkeypatch):
+    from PyQt5.QtWidgets import QApplication, QInputDialog, QMessageBox
+    import gui
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(gui.MainWindow, '_save_history', lambda self: None)
+    window = gui.MainWindow()
+    plot = None
+    try:
+        assert window._display_example_name(get_van_der_pol_tasks()[1].name) == \
+            'Ван дер Поль: начальная точка (4, 2)'
+        assert window.residual_label.text() == 'Максимальная невязка граничных условий: —'
+        assert window.solve_btn.toolTip().startswith('Решить задачу')
+        assert window.equation_edits[0].toolTip().startswith('f(t, x1…x4): правая часть')
+        assert window._localized_error('Initial guesses must be finite.') == \
+            'Начальные приближения должны быть конечными числами.'
+        monkeypatch.setattr(QMessageBox, 'critical', lambda *args: pytest.fail(str(args[-1])))
+        def choose_example(dialog):
+            items = dialog.comboBoxItems()
+            assert items[4].startswith('5. Ван дер Поль: начальная точка')
+            assert dialog.okButtonText() == 'ОК'
+            assert dialog.cancelButtonText() == 'Отмена'
+            dialog.setTextValue(items[4])
+            return 1
+        monkeypatch.setattr(QInputDialog, 'exec_', choose_example)
+        window.show_examples()
+        assert window.name_edit.text() == 'Ван дер Поль: начальная точка (0.1, 0)'
+        window.dim_spin.setValue(2)
+        assert 'правая часть' in window.equation_edits[0].toolTip()
+        plot = gui.PlotWindow(np.linspace(0, 1, 5), np.array([
+            np.linspace(0, 1, 5), np.linspace(1, 0, 5)]),
+            ['x1', 'x2'], 'Тест', window)
+        assert plot.btn_split.text() == 'Разделить решения'
+        window._on_lang_selected('en')
+        assert window.residual_label.text() == 'max boundary residual: —'
+        assert window.solve_btn.toolTip().startswith('Solve the problem')
+        assert window._localized_error('Initial guesses must be finite.') == \
+            'Initial guesses must be finite.'
+        assert plot.btn_split.text() == 'Split solutions'
+        window._on_lang_selected('ru')
+        assert plot.btn_split.text() == 'Разделить решения'
+    finally:
+        if plot is not None:
+            plot.close()
+        window.close()
+        app.processEvents()
+
+
+@pytest.mark.parametrize('filter_name, suffix, signature', [
+    ('PNG (*.png)', '.png', b'\x89PNG\r\n\x1a\n'),
+    ('SVG (*.svg)', '.svg', b'<svg'),
+    ('PDF (*.pdf)', '.pdf', b'%PDF'),
+])
+def test_plot_window_saves_current_view_in_selected_format(
+        tmp_path, monkeypatch, filter_name, suffix, signature):
+    from PyQt5.QtWidgets import QApplication
+    import gui
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(gui.MainWindow, '_save_history', lambda self: None)
+    window = gui.MainWindow()
+    plot = None
+    try:
+        t = np.linspace(0, 1, 20)
+        plot = gui.PlotWindow(t, np.vstack([t, 1 - t]), ['x1', 'x2'],
+                              'Тестовый график', window)
+        plot._x_idx = 1
+        plot._y_indices = [1]
+        plot._redraw()
+        assert plot.canvas.axes.get_xlabel() == 'x1'
+        assert plot.canvas.axes.get_ylabel() == 'x2'
+        assert plot.btn_save.text() == 'Сохранить рисунок'
+        monkeypatch.setattr(gui.QFileDialog, 'getSaveFileName',
+                            lambda *args: (str(tmp_path / 'current_view'), filter_name))
+        plot.btn_save.click()
+        payload = (tmp_path / ('current_view' + suffix)).read_bytes()
+        assert signature in payload[:1000]
+        window._on_lang_selected('en')
+        assert plot.btn_save.text() == 'Save image'
+        window._on_lang_selected('ru')
+        assert plot.btn_save.text() == 'Сохранить рисунок'
+    finally:
+        if plot is not None:
+            plot.close()
         window.close()
         app.processEvents()
 
