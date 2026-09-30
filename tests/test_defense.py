@@ -178,6 +178,87 @@ def test_plot_window_saves_current_view_in_selected_format(
         app.processEvents()
 
 
+@pytest.mark.parametrize('custom_name', [None, 'My guess experiment'])
+def test_solved_plot_title_and_save_name_follow_language(monkeypatch, custom_name):
+    from PyQt5.QtWidgets import QApplication
+    import gui
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(gui.MainWindow, '_save_history', lambda self: None)
+    monkeypatch.setattr(gui.SolverThread, 'start', gui.SolverThread.run)
+    suggested = []
+    def cancel_save(parent, title, filename, filters):
+        suggested.append(filename)
+        return '', ''
+    monkeypatch.setattr(gui.QFileDialog, 'getSaveFileName', cancel_save)
+    window = gui.MainWindow()
+    try:
+        dataset = get_van_der_pol_tasks()[0]
+        if custom_name:
+            dataset = replace(dataset, name=custom_name)
+        window.set_dataset_to_ui(dataset)
+        window.start_solve()
+        assert window._status_state == 'done'
+        values = window._last_y.copy()
+        revision = window._input_revision
+        for lang in ('ru', 'en', 'ru'):
+            window._on_lang_selected(lang)
+            plot = window._plot_windows[0]
+            expected_name = custom_name or (
+                'Ван дер Поль: начальная точка (0.1, 0)' if lang == 'ru'
+                else 'Van der Pol: initial point (0.1, 0)')
+            expected_guess = ('Начальное приближение' if lang == 'ru' else 'Initial guess')
+            assert plot.windowTitle() == f'{expected_name}  |  {expected_guess}: (0.1, 0.0)'
+            plot.save_plot()
+            assert expected_guess in suggested[-1]
+            if not custom_name and lang == 'ru':
+                assert 'guess' not in suggested[-1]
+                assert 'Van der Pol' not in suggested[-1]
+            title = plot.windowTitle()
+            window.show_plot_window()
+            assert window._plot_windows[0].windowTitle() == title
+            assert window._input_revision == revision
+            np.testing.assert_array_equal(window._last_y, values)
+    finally:
+        window._close_plot_windows()
+        window.close()
+        app.processEvents()
+
+
+def test_split_plot_titles_keep_translatable_parts(monkeypatch):
+    from PyQt5.QtWidgets import QApplication
+    import gui
+    app = QApplication.instance() or QApplication([])
+    window = gui.MainWindow()
+    try:
+        t = np.linspace(0, 1, 10)
+        states = np.vstack([t, 1 - t])
+        layers = [(t, states, None, f'cycle {i} ← guess ({i}, 6)') for i in (1, 2)]
+        combined = gui.PlotWindow(layers, None, ['x1', 'x2'],
+                                  get_van_der_pol_tasks()[0].name, window,
+                                  initial_guess=[0.1, 0.0])
+        window._plot_windows = [combined]
+        combined._toggle_split_view()
+        split = window._plot_windows[1:]
+        assert len(split) == 2
+        for lang in ('en', 'ru', 'en'):
+            window._on_lang_selected(lang)
+            for index, plot in enumerate(split, 1):
+                title = plot.windowTitle()
+                if lang == 'ru':
+                    assert title.startswith('Ван дер Поль:')
+                    assert 'Начальное приближение: (0.1, 0.0)' in title
+                    assert f'цикл {index} ← приближение ({index}, 6)' in title
+                    assert 'guess' not in title
+                else:
+                    assert title.startswith('Van der Pol:')
+                    assert 'Initial guess: (0.1, 0.0)' in title
+                    assert f'cycle {index} ← guess ({index}, 6)' in title
+    finally:
+        window._close_plot_windows()
+        window.close()
+        app.processEvents()
+
+
 def test_parameter_layers_keep_separate_diagnostics():
     from PyQt5.QtWidgets import QApplication
     import gui

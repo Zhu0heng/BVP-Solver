@@ -855,12 +855,15 @@ class PlotCanvas(FigureCanvas):
 class PlotWindow(QMainWindow):
     def __init__(self, t_data, y_data, varnames, title, parent=None, problem_type='custom',
                  color_offset=0, layer_style_index=None, layer_style_count=None,
-                 initial_x_name=None, initial_y_names=None):
+                 initial_x_name=None, initial_y_names=None,
+                 initial_guess=None, layer_label=''):
         super().__init__(parent)
         self.setStyleSheet(STYLESHEET)
         self.setWindowTitle(title)
         self.setGeometry(150, 150, 1100, 800)
         self.dataset_title = title
+        self.initial_guess = tuple(initial_guess) if initial_guess is not None else ()
+        self.layer_label = layer_label
         self.varnames = varnames
         self.problem_type = problem_type
         # Сдвиг индекса палитры: при «разделении» окон каждый слой сохраняет
@@ -918,6 +921,11 @@ class PlotWindow(QMainWindow):
         title = self.dataset_title
         if isinstance(parent, MainWindow):
             title = parent._display_example_name(title)
+        if self.initial_guess:
+            values = ', '.join(str(value) for value in self.initial_guess)
+            title += '  |  ' + self._tr('plot_guess').format(values=values)
+        if self.layer_label:
+            title += ' — ' + self._display_curve_label(self.layer_label)
         self.setWindowTitle(title)
         self.btn_split.setText(self._tr('plot_split'))
         self.btn_split.setToolTip(self._tr('plot_split_tip'))
@@ -1131,19 +1139,19 @@ class PlotWindow(QMainWindow):
                 continue
             if t_i is None or y_i is None:
                 continue
-            title_i = f"{self.dataset_title} — {label_i}" if label_i else \
-                      f"{self.dataset_title} #{i+1}"
             # Всегда упаковываем слой как одноэлементный список, чтобы метка
             # (label_i) сохранялась в раздельном окне.  Раньше слои без полной
             # орбиты (full_i is None — предельные циклы) передавались сырыми
             # массивами и теряли подпись «кто есть кто».
             packed = [(t_i, y_i, full_i, label_i or f'#{i+1}')]
             # color_offset=i → слой сохраняет свой цвет из совмещённого графика.
-            w = PlotWindow(packed, None, vn, title_i, mw, self.problem_type,
+            w = PlotWindow(packed, None, vn, self.dataset_title, mw, self.problem_type,
                            color_offset=i, layer_style_index=i,
                            layer_style_count=len(layers),
                            initial_x_name=selected_x,
-                           initial_y_names=selected_y)
+                           initial_y_names=selected_y,
+                           initial_guess=self.initial_guess,
+                           layer_label=label_i or f'#{i+1}')
             w.setGeometry(150 + 40 * i, 150 + 40 * i, 1000, 700)
             w.show()
             new_windows.append(w)
@@ -1407,6 +1415,7 @@ class MainWindow(QMainWindow):
             'examples_tip': 'Load a built-in example',
             'json_filter': 'JSON files (*.json)',
             'plot_split': 'Split solutions',
+            'plot_guess': 'Initial guess: ({values})',
             'plot_split_tip': 'Open each solution in a separate window',
             'plot_save': 'Save image',
             'plot_save_tip': 'Save the current plot as PNG, SVG or PDF',
@@ -1529,6 +1538,7 @@ class MainWindow(QMainWindow):
             'examples_tip': 'Загрузить встроенный пример',
             'json_filter': 'Файлы JSON (*.json)',
             'plot_split': 'Разделить решения',
+            'plot_guess': 'Начальное приближение: ({values})',
             'plot_split_tip': 'Открыть каждое решение в отдельном окне',
             'plot_save': 'Сохранить рисунок',
             'plot_save_tip': 'Сохранить текущий график в формате PNG, SVG или PDF',
@@ -1565,7 +1575,7 @@ class MainWindow(QMainWindow):
         self._last_x = None
         self._last_y = None
         self._last_name = ""
-        self._last_guess_label = ""
+        self._last_plot_guess = ()
         self._last_problem_type = "custom"
         self._status_state = 'ready'
 
@@ -2676,12 +2686,9 @@ class MainWindow(QMainWindow):
 
             self._last_problem_type = prob_type
 
-            # Store guess label for plot window title
-            if initial_guess:
-                vals = [str(v) for v in initial_guess]
-                self._pending_guess_label = f'  |  guess: ({", ".join(vals)})'
-            else:
-                self._pending_guess_label = ''
+            # Keep the values separate from the title so language switches
+            # can translate app text without modifying the task name.
+            self._pending_plot_guess = tuple(initial_guess) if initial_guess is not None else ()
 
             self.solver_thread = SolverThread(dataset, initial_guess,
                                               smooth_param_list=mu_list,
@@ -2712,7 +2719,7 @@ class MainWindow(QMainWindow):
         self._format_residual()
         self.graph_btn.setEnabled(True)
         self._last_name = self._display_example_name(self.current_dataset.name) if self.current_dataset else ""
-        self._last_guess_label = getattr(self, '_pending_guess_label', '')
+        self._last_plot_guess = getattr(self, '_pending_plot_guess', ())
         if self.current_dataset:
             name = self._display_example_name(self.current_dataset.name)
             self._add_history(name)
@@ -2760,9 +2767,9 @@ class MainWindow(QMainWindow):
             return
         self._close_plot_windows()
         vn = self._get_varnames()
-        title = (self._last_name or "") + (self._last_guess_label or "")
         win = PlotWindow(self._last_x, self._last_y, vn,
-                         title, self, self._last_problem_type)
+                         self._last_name or '', self, self._last_problem_type,
+                         initial_guess=self._last_plot_guess)
         win.show()
         self._plot_windows.append(win)
 
