@@ -2,6 +2,12 @@
 
 Ли Чжохэн · проект BVP-Solver
 
+Имена функций и классов в тексте — ссылки на начало их определения в GitHub.
+Ссылки на переменные ведут к строкам, где они задаются или используются.
+Ссылки закреплены за проверенной версией кода, поэтому последующие правки
+не сдвинут их на другие строки. При чтении локального Markdown они открывают
+код в браузере.
+
 ---
 
 ## Кратко: что сделано и что получилось
@@ -44,14 +50,14 @@ python -m pytest -q           # проверка проекта
 
 Первый запуск начинается близко к равновесию $(0,0)$, внутри будущего цикла;
 второй — далеко снаружи. Поэтому первые участки выглядят по-разному.
-В `compute_experiment()` из [defense_experiment.py](defense_experiment.py)
+В [compute_experiment()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/defense_experiment.py#L76) из [defense_experiment.py](defense_experiment.py)
 проверяется не только картинка: сравниваются последние периоды, точки
 пересечения с выбранной прямой и сами последние обороты после выравнивания
 по фазе. Значения в таблице взяты из
 [diagnostics.json](defense_artifacts/diagnostics.json).
 
 Обычная кнопка сохранения в интерфейсе сохраняет текущий график одного
-запуска. Рисунок выше строит `save_phase_portrait()`: она объединяет два
+запуска. Рисунок выше строит [save_phase_portrait()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/defense_experiment.py#L121): она объединяет два
 запуска и отдельно показывает их последние обороты. Поэтому эти изображения
 могут выглядеть по-разному при одинаковых исходных данных.
 
@@ -59,8 +65,8 @@ python -m pytest -q           # проверка проекта
 
 ## 1. Как система записана в программе?
 
-Система хранится **не как код, а как строки** в объекте `Dataset`. Функция
-`get_van_der_pol_tasks()` в [task_io.py](task_io.py) создаёт два набора данных:
+Система хранится **не как код, а как строки** в объекте [Dataset](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/dataset.py#L20). Функция
+[get_van_der_pol_tasks()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/task_io.py#L30) в [task_io.py](task_io.py) создаёт два набора данных:
 
 ```python
 equations=[
@@ -83,16 +89,16 @@ $x_1(0)=4$, $x_2(0)=2$.
 **Три момента, которые важно проговорить:**
 
 1. Уравнения записаны в виде «производная минус правая часть $=0$».
-   Функция `parse_equation_system()` в [parser.py](parser.py) выражает
+   Функция [parse_equation_system()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/parser.py#L143) в [parser.py](parser.py) выражает
    производную через `sp.solve` и создаёт функции для численного вычисления.
 2. Оба граничных условия заданы **в одной точке** $a=0$ (левый конец).
    Они фиксируют всю начальную точку, поэтому это задачи Коши,
    представленные через общий интерфейс граничных условий.
-3. Правую часть считает `ContinuationSolver._ode_system()` в [solver.py](solver.py).
+3. Правую часть считает [ContinuationSolver._ode_system()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L100) в [solver.py](solver.py).
 
-В `Dataset` также указаны `x_start=0`, `x_end=60`. Буква `a` в условиях
+В [Dataset](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/dataset.py#L20) также указаны `x_start=0`, `x_end=60`. Буква `a` в условиях
 обозначает начало этого отрезка, а `b` — конец. Значения `x0`, `y0` задают
-условия задачи. Переданное в `solve(initial)` начальное приближение помогает
+условия задачи. Переданное в [solve(initial)](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319) начальное приближение помогает
 решателю; оно не заменяет эти условия. Если изменить только приближение,
 решатель всё равно должен выполнить условия из `boundary_conditions`.
 
@@ -110,7 +116,7 @@ $x_1(0)=4$, $x_2(0)=2$.
 * `6001` точка в настройках задаёт **только частоту вывода**, а не шаг
   интегрирования;
 * результат ($t$, траектория) используется для графика; это делает
-  `ContinuationSolver._integrate_solution()` в [solver.py](solver.py).
+  [ContinuationSolver._integrate_solution()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L395) в [solver.py](solver.py).
 
 В этой функции включено `dense_output=True`. После интегрирования программа
 берёт 6001 равномерный момент времени и вычисляет в них решение через
@@ -118,7 +124,7 @@ $x_1(0)=4$, $x_2(0)=2$.
 интегратора могут быть другими. Здесь `rtol=1e-10`, `atol=1e-13` управляют
 оценкой локальной ошибки, но не гарантируют такую же ошибку всего решения.
 
-**Период $T$ заранее нигде не вводится.** Его оценивает функция `analyse_tail()`
+**Период $T$ заранее нигде не вводится.** Его оценивает функция [analyse_tail()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/defense_experiment.py#L46)
 в [defense_experiment.py](defense_experiment.py) уже **после** интегрирования:
 
 1. после $t=40$ находятся пересечения $x_1=0$ от отрицательного $x_1$
@@ -214,17 +220,17 @@ $$x_1(1)-x_1(0)=0,\qquad x_2(1)-x_2(0)=0.$$
 период, надо дополнительно проверить, что за найденное $T$ пройден один
 оборот: условия замыкания допускают и несколько оборотов.
 
-В терминах проекта это новая постановка `Dataset`: три уравнения с
+В терминах проекта это новая постановка [Dataset](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/dataset.py#L20): три уравнения с
 `x3=T`, отрезок $[0,1]$, условия `x1(b)=x1(a)`, `x2(b)=x2(a)`,
-`x2(a)=0`. Метод `ContinuationSolver.solve()` должен подбирать начальные
+`x2(a)=0`. Метод [ContinuationSolver.solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319) должен подбирать начальные
 значения трёх компонент. Проверки положительного периода, ненулевой
 амплитуды и выбора нужного оборота также должны входить в этот режим.
 Текущий запуск `--defense` такой подбор не выполняет.
 
 Такая идея уже реализована в проекте — **пример 26.2** (система Эквейлера), где
 период является одной из переменных состояния. Постановка находится в
-`get_example_tasks()` из [task_io.py](task_io.py), а специальный алгоритм —
-в `SolverThread._solve_limit_cycles()` из [gui.py](gui.py). Это пример
+[get_example_tasks()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/task_io.py#L44) из [task_io.py](task_io.py), а специальный алгоритм —
+в [SolverThread._solve_limit_cycles()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L296) из [gui.py](gui.py). Это пример
 похожего подхода; сами уравнения Ван дер Поля заданы отдельно.
 
 ---
@@ -239,10 +245,10 @@ $$R_{\max}=\max_i|R_i| .$$
 
 ### Где вычисляются невязки и откуда берутся значения $R_i$?
 
-`parse_boundary_conditions()` и `_normalize_bc()` в [parser.py](parser.py)
+[parse_boundary_conditions()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/parser.py#L269) и [_normalize_bc()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/parser.py#L249) в [parser.py](parser.py)
 превращают каждое равенство в «левая часть минус правая часть».
 Например, `x1(a)=0.1` превращается в функцию $R_1=x_1(a)-0.1$.
-Эти функции сохраняются в `bc_funcs`. `_boundary_residual()` подставляет
+Эти функции сохраняются в `bc_funcs`. [_boundary_residual()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L143) подставляет
 в них вычисленные значения состояния на концах отрезка.
 
 Для первого запуска $R_1=x_1(0)-0.1$, $R_2=x_2(0)$;
@@ -255,32 +261,32 @@ $$R_{\max}=\max_i|R_i| .$$
 
 | Шаг | Где |
 |---|---|
-| Граничные условия разбираются в функции-невязки | `_init_bc()` в [solver.py](solver.py), результат — список `bc_funcs` |
-| Каждый вызов из `bc_funcs` даёт одну компоненту $R_i$ | `_boundary_residual()` |
-| Берётся максимум модуля | `BoundaryDiagnostics.max_boundary_residual` |
-| Значение передаётся в интерфейс | `SolverThread` → `on_solve_finished()` → `_format_residual()` в [gui.py](gui.py) |
-| При изменении входных данных старое значение убирается | `_clear_result()` |
+| Граничные условия разбираются в функции-невязки | [_init_bc()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L81) в [solver.py](solver.py), результат — список `bc_funcs` |
+| Каждый вызов из `bc_funcs` даёт одну компоненту $R_i$ | [_boundary_residual()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L143) |
+| Берётся максимум модуля | [BoundaryDiagnostics.max_boundary_residual](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L30) |
+| Значение передаётся в интерфейс | [SolverThread](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L189) → [on_solve_finished()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L2707) → [_format_residual()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L1602) в [gui.py](gui.py) |
+| При изменении входных данных старое значение убирается | [_clear_result()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L1896) |
 
 ### Какие функции и классы были добавлены или изменены?
 
-В [solver.py](solver.py) добавлен `BoundaryDiagnostics`, который хранит
-вектор `residuals` и вычисляет его максимум. `_boundary_residual()`
+В [solver.py](solver.py) добавлен [BoundaryDiagnostics](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L18), который хранит
+вектор `residuals` и вычисляет его максимум. [_boundary_residual()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L143)
 выделяет подстановку в граничные условия в отдельную операцию.
-`_phi()` использует её во время подбора начальной точки, а `solve()` —
+[_phi()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L121) использует её во время подбора начальной точки, а [solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319) —
 ещё раз для окончательного результата и сохраняет `last_diagnostics`.
 
-В [gui.py](gui.py) `SolverThread` собирает `boundary_diagnostics` для
-полученных решений. `MainWindow.on_solve_finished()` читает их,
-`_format_residual()` показывает максимум, а `_clear_result()` сбрасывает
+В [gui.py](gui.py) [SolverThread](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L189) собирает `boundary_diagnostics` для
+полученных решений. [MainWindow.on_solve_finished()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L2707) читает их,
+[_format_residual()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L1602) показывает максимум, а [_clear_result()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/gui.py#L1896) сбрасывает
 устаревшее значение. Если на графике несколько решений, строка показывает
 наибольшую невязку среди них, а подсказка содержит значения по отдельности.
-В `compute_experiment()` из [defense_experiment.py](defense_experiment.py)
-читается готовый `solver.last_diagnostics`; `run_experiment()` печатает его
+В [compute_experiment()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/defense_experiment.py#L76) из [defense_experiment.py](defense_experiment.py)
+читается готовый `solver.last_diagnostics`; [run_experiment()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/defense_experiment.py#L151) печатает его
 и сохраняет вместе с результатами.
 
 ### Почему выбрано это место вычисления?
 
-**Ключевая деталь:** в конце `ContinuationSolver.solve()` в `_boundary_residual()`
+**Ключевая деталь:** в конце [ContinuationSolver.solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319) в [_boundary_residual()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L143)
 передаются начало и конец **той самой траектории, которая возвращается
 пользователю**, а не промежуточной итерации и не отдельно переинтегрированной
 кривой. То есть значение берётся из **уже существующего процесса решения**, как и
@@ -288,7 +294,7 @@ $$R_{\max}=\max_i|R_i| .$$
 
 Это нужно потому, что малая невязка промежуточного приближения ещё не
 подтверждает качество окончательно возвращённой траектории. Здесь проверка
-выполняется после `_integrate_solution()`, но до `return` из `solve()`.
+выполняется после [_integrate_solution()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L395), но до `return` из [solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319).
 При слишком большой невязке решатель сообщает об ошибке. Поэтому интерфейс
 получает диагностику именно того результата, который он показывает.
 Отдельный запуск программы для пересчёта этой величины не нужен.
@@ -340,7 +346,7 @@ f_z=\begin{pmatrix}
 \end{pmatrix}.
 $$
 
-В `_integrate_state_and_variational()` функция `augmented()` объединяет
+В [_integrate_state_and_variational()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L177) функция [augmented()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L183) объединяет
 производные состояния и матрицы в один вектор. `solve_ivp` интегрирует
 его целиком: два уравнения для состояния и четыре для элементов $X$.
 Одна и та же текущая траектория используется для вычисления $f_z$.
@@ -357,7 +363,7 @@ X(a)=\frac{\partial p}{\partial p}
 =\begin{pmatrix}1&0\\0&1\end{pmatrix}=I.
 $$
 
-При $a=0$ получаем $X(0)=I$. В коде это `np.eye(n)` внутри `z0`.
+При $a=0$ получаем $X(0)=I$. В коде это `np.eye(n)` внутри [z0](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L181).
 Позже элементы вне диагонали могут стать ненулевыми, потому что уравнения
 связывают компоненты состояния друг с другом.
 
@@ -365,10 +371,10 @@ $$
 
 | Что | Имя в коде |
 |---|---|
-| Матрица $X$ | `transition` |
-| Производная правой части по состоянию, $f_z$ | `state_jac` |
-| Совместное интегрирование $X'=f_zX$ и основного уравнения | `_integrate_state_and_variational()` |
-| Использование: $\Phi'(p)=R_a+R_bX(b)$ | `_phi_jacobian()` |
+| Матрица $X$ | [transition](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L185) |
+| Производная правой части по состоянию, $f_z$ | [state_jac](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L187) |
+| Совместное интегрирование $X'=f_zX$ и основного уравнения | [_integrate_state_and_variational()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L177) |
+| Использование: $\Phi'(p)=R_a+R_bX(b)$ | [_phi_jacobian()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L232) |
 
 ### Где полученная матрица используется дальше?
 
@@ -382,14 +388,14 @@ $$\Phi'(p)=R_a+R_bX(b).$$
 конечному. Это не производные по времени $a$ и $b$.
 Первое слагаемое учитывает прямое изменение начального состояния,
 второе — изменение конечного состояния после интегрирования.
-В `_boundary_partials()` им соответствуют `r_start` и `r_end`;
-`_phi_jacobian()` вычисляет `jac = r_start + r_end @ transition`.
+В [_boundary_partials()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L205) им соответствуют `r_start` и `r_end`;
+[_phi_jacobian()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L232) вычисляет [jac = r_start + r_end @ transition](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L237).
 
 ### Какова её роль при решении краевой задачи?
 
 Если выбранная начальная точка даёт неверный конец траектории, нужно понять,
 как её сдвинуть, чтобы уменьшить невязки. Матрица $\Phi'(p)$ сообщает,
-как эти невязки реагируют на сдвиг. `_continuation_path()` использует её
+как эти невязки реагируют на сдвиг. [_continuation_path()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L255) использует её
 в `np.linalg.lstsq()` для шагов продолжения и для последующей коррекции
 начальных данных. После изменения точки программа снова интегрирует
 систему и проверяет условия. То есть $X$ помогает найти подходящий старт,
@@ -400,13 +406,13 @@ $$\Phi'(p)=R_a+R_bX(b).$$
 
 | Как вызвано | Начальное приближение | Начальная невязка | Коррекция |
 |---|---|---|---|
-| `solve()` без аргумента, первый пример | $[2,\,0]$ (значение по умолчанию) | $R_{\max}=1.9$ | **выполняется** |
-| `solve()` без аргумента, второй пример | $[2,\,0]$ | $R_{\max}=2$ | **выполняется** |
+| [solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319) без аргумента, первый пример | $[2,\,0]$ (значение по умолчанию) | $R_{\max}=1.9$ | **выполняется** |
+| [solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319) без аргумента, второй пример | $[2,\,0]$ | $R_{\max}=2$ | **выполняется** |
 | Так, как в `--defense` | сама заданная точка: $[0.1,\,0]$ или $[4,\,2]$ | $0$ | **пропускается** |
 
-В `defense_experiment.py` заданная начальная точка передаётся в `solve()`
-явно (строка `t, states = solver.solve(initial)`), поэтому невязка уже нулевая
-и `_continuation_path()` сразу выходит.
+В `defense_experiment.py` заданная начальная точка передаётся в [solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319)
+явно (строка [t, states = solver.solve(initial)](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/defense_experiment.py#L87)), поэтому невязка уже нулевая
+и [_continuation_path()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L255) сразу выходит.
 
 В данном запуске `--defense` коррекция не нужна, поскольку начальные условия
 уже выполнены. При другом приближении общий решатель может использовать
@@ -415,7 +421,7 @@ $$\Phi'(p)=R_a+R_bX(b).$$
 и переданного приближения.
 
 **Техническая деталь:** $f_z$ вычисляется **численно, центральной разностью**
-(`_state_jacobian()`), а не символьно. Это стоит упомянуть, если спросят, откуда
+([_state_jacobian()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L160)), а не символьно. Это стоит упомянуть, если спросят, откуда
 берётся матрица вариаций.
 
 ---
@@ -424,12 +430,12 @@ $$\Phi'(p)=R_a+R_bX(b).$$
 
 **«Сколько раз вызывается `solve_ivp`?»**
 Число зависит от начального приближения и настроек. В текущем `--defense`
-на один запуск приходится **3 вызова**: `_phi()` в начале
-`_continuation_path()`, повторная проверка `_phi()` в `solve()` и
-окончательное интегрирование в `_integrate_solution()`. Все три решают
+на один запуск приходится **3 вызова**: [_phi()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L121) в начале
+[_continuation_path()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L255), повторная проверка [_phi()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L121) в [solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319) и
+окончательное интегрирование в [_integrate_solution()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L395). Все три решают
 систему из двух уравнений. Для двух начальных точек это 6 вызовов.
 
-При `solve()` без начального приближения в каждом из этих двух примеров
+При [solve()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/solver.py#L319) без начального приближения в каждом из этих двух примеров
 проверка дала **14 вызовов**, из них 10 — для расширенной системы из
 шести уравнений. Это результат текущих настроек с 10 шагами продолжения,
 а не постоянное свойство `solve_ivp` или системы Ван дер Поля.
@@ -456,7 +462,7 @@ $\varphi\in[0,1]$ и отсчитывается от своего пересеч
 точного периода: есть ошибки интегрирования и интерполяции.
 Для проверки точности полезно уменьшить допуск, увеличить число точек
 и сравнить результат с другим методом. Тест
-`test_two_initial_points_converge_with_independent_integrators()` в
+[test_two_initial_points_converge_with_independent_integrators()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/tests/test_defense.py#L14) в
 [tests/test_defense.py](tests/test_defense.py) сравнивает DOP853 с RK45
 при другом допуске. В устном ответе достаточно сказать $T\approx6.6633$.
 
@@ -470,7 +476,7 @@ $\varphi\in[0,1]$ и отсчитывается от своего пересеч
 * объяснить, что `--defense` решает задачу Коши, а не периодическую краевую задачу.
 
 Например, чтобы изменить физическую начальную точку первого запуска,
-нужно исправить пару `(0.1, 0.0)` в `get_van_der_pol_tasks()` или оба
+нужно исправить пару `(0.1, 0.0)` в [get_van_der_pol_tasks()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/task_io.py#L30) или оба
 начальных условия в интерфейсе. Изменение только поля начального
 приближения не меняет саму задачу. После пересчёта надо снова посмотреть
 траекторию, невязку и признаки сходимости.
@@ -479,7 +485,7 @@ $\varphi\in[0,1]$ и отсчитывается от своего пересеч
 
 | Пункт задания | Где найти результат или ответ |
 |---|---|
-| Две разные начальные точки и сохранённый график | Начало этого документа; `get_van_der_pol_tasks()`; `defense_artifacts/van_der_pol_phase.png` |
+| Две разные начальные точки и сохранённый график | Начало этого документа; [get_van_der_pol_tasks()](https://github.com/Zhu0heng/BVP-Solver/blob/1793951a67a53225f55e0f1494541e436322bdca/task_io.py#L30); `defense_artifacts/van_der_pol_phase.png` |
 | Пять вопросов об эксперименте | Разделы 1–5 |
 | Место вычисления невязки и источник $R_i$ | «Где вычисляются невязки и откуда берутся значения $R_i$?» |
 | Изменённые функции и классы | «Какие функции и классы были добавлены или изменены?» |
